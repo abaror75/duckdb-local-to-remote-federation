@@ -33,9 +33,9 @@ struct SerializationData {
 	// forward-declared.
 	SerializationData();
 	SerializationData(const SerializationData &);
-	SerializationData(SerializationData &&) noexcept;
+	SerializationData(SerializationData &&);
 	SerializationData &operator=(const SerializationData &);
-	SerializationData &operator=(SerializationData &&) noexcept;
+	SerializationData &operator=(SerializationData &&);
 	~SerializationData();
 
 	stack<reference<ClientContext>> contexts;
