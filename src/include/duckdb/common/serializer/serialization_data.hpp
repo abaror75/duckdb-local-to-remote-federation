@@ -16,6 +16,8 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
 
+#include <type_traits>
+
 namespace duckdb {
 class ClientContext;
 class Catalog;
@@ -23,20 +25,13 @@ class DatabaseInstance;
 class CompressionInfo;
 enum class ExpressionType : uint8_t;
 
-struct SerializationData {
+// The data members live in this base so that the move specifications of SerializationData can be computed from the
+// members themselves rather than from a hand-maintained list of member types: a member added here is accounted for
+// automatically, and the specifications can never silently claim more than the members provide.
+struct SerializationDataMembers {
 	struct CustomData {
 		virtual ~CustomData() = default;
 	};
-
-	// Out-of-line so the special members touching stack<const_reference<CompressionInfo>> are only instantiated where
-	// the type is complete (serialization_data.cpp); other TUs may reach this header with CompressionInfo
-	// forward-declared.
-	SerializationData();
-	SerializationData(const SerializationData &);
-	SerializationData(SerializationData &&);
-	SerializationData &operator=(const SerializationData &);
-	SerializationData &operator=(SerializationData &&);
-	~SerializationData();
 
 	stack<reference<ClientContext>> contexts;
 	stack<reference<DatabaseInstance>> databases;
@@ -46,6 +41,26 @@ struct SerializationData {
 	stack<const_reference<LogicalType>> types;
 	stack<const_reference<CompressionInfo>> compression_infos;
 	duckdb::unordered_map<std::string, duckdb::stack<duckdb::reference<CustomData>>> customs;
+};
+
+struct SerializationData : SerializationDataMembers {
+	// stack is backed by std::deque, whose move constructor is not nothrow in every standard library, so the
+	// guarantee cannot be stated unconditionally - it is computed from the members instead. Move construction and
+	// move assignment are computed separately because they do not necessarily agree (with libstdc++, only the
+	// latter is nothrow).
+	static constexpr bool NOTHROW_MOVE_CTOR = std::is_nothrow_move_constructible<SerializationDataMembers>::value;
+	static constexpr bool NOTHROW_MOVE_ASSIGN = std::is_nothrow_move_assignable<SerializationDataMembers>::value;
+
+	// Out-of-line so the special members touching stack<const_reference<CompressionInfo>> are only instantiated where
+	// the type is complete (serialization_data.cpp); other TUs may reach this header with CompressionInfo
+	// forward-declared. The specifications above only need the members' declarations, not their definitions, so they
+	// are safe to evaluate here.
+	SerializationData();
+	SerializationData(const SerializationData &);
+	SerializationData(SerializationData &&) noexcept(NOTHROW_MOVE_CTOR);
+	SerializationData &operator=(const SerializationData &);
+	SerializationData &operator=(SerializationData &&) noexcept(NOTHROW_MOVE_ASSIGN);
+	~SerializationData();
 
 	template <class T>
 	void Set(T entry) = delete;
