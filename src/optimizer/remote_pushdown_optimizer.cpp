@@ -12,6 +12,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -500,6 +501,44 @@ void RemotePushdownOptimizer::CollectConjuncts(ParsedExpression &expr,
 	conjuncts.push_back(expr);
 }
 
+bool RemotePushdownOptimizer::ContainsVolatileFunction(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &func = expr.Cast<FunctionExpression>();
+		EntryLookupInfo function_lookup(CatalogType::SCALAR_FUNCTION_ENTRY, func.GetQualifiedName());
+		auto entry = Catalog::GetEntry(binder.context, function_lookup, OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			if (entry->type == CatalogType::MACRO_ENTRY) {
+				// The expansion is not visible before binding and could itself be volatile
+				return true;
+			}
+			if (entry->type == CatalogType::SCALAR_FUNCTION_ENTRY) {
+				// The overload is chosen at bind time, so decline if ANY candidate is volatile.
+				// This is the opposite polarity to the constant-folding test, which only needs one
+				// non-volatile overload to exist: folding an expression that turns out volatile is
+				// caught after binding, whereas a fragment has already been shipped.
+				auto &scalar_entry = entry->Cast<ScalarFunctionCatalogEntry>();
+				for (auto &overload : scalar_entry.functions.functions) {
+					if (overload->GetStability() == FunctionStability::VOLATILE) {
+						return true;
+					}
+				}
+			}
+		}
+		// An unresolvable name is left alone: binding rejects the query anyway.
+	}
+	// Recurse explicitly rather than via ParsedExpressionIterator::VisitExpression<FunctionExpression>,
+	// which stops descending as soon as a node matches the requested class. Arithmetic operators are
+	// themselves FunctionExpressions in DuckDB, so `random() * 100000` matches on the `*` and the
+	// visitor never reaches the random() underneath it.
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (!found && ContainsVolatileFunction(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
 bool RemotePushdownOptimizer::CanPushConjunctTo(const ParsedExpression &expr, const identifier_set_t &aliases) {
 	// A subquery may correlate to the other side of the join or to a local table
 	if (expr.HasSubquery()) {
@@ -507,6 +546,13 @@ bool RemotePushdownOptimizer::CanPushConjunctTo(const ParsedExpression &expr, co
 	}
 	// WHERE cannot legally contain these, but a malformed tree must not be shipped
 	if (expr.IsAggregate() || expr.IsWindow()) {
+		return false;
+	}
+	// BuildPushableFilter pushes a copy and leaves the original in the master's WHERE, which is a
+	// harmless re-application for a deterministic predicate. A volatile one would instead be two
+	// independent evaluations: `amt > random() * 100000` becomes two different draws, and
+	// nextval() would advance the sequence twice.
+	if (ContainsVolatileFunction(expr)) {
 		return false;
 	}
 	// Every column reference has to be explicitly qualified by a table on this side. An
@@ -704,6 +750,12 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 	// subtree. The flat remote result would otherwise collide on any column name the
 	// tables share (order_id appears in both orders and order_items).
 	vector<unique_ptr<ParsedExpression>> projection;
+	// alias__column is not injective: alias `o` column `x__y` and alias `o__x` column `y` both
+	// produce o__x__y. The flat result would carry the name twice and the master would bind the
+	// first for both, silently reading one column's values under the other's name. Track the
+	// names and decline the whole grouping on a collision - the caller then pushes each table
+	// separately, which is correct and merely loses the optimization here.
+	case_insensitive_set_t projected_names;
 	for (auto &entry : tables) {
 		auto &alias = entry.first;
 		auto &base = entry.second.get();
@@ -722,9 +774,13 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 			return false;
 		}
 		for (auto &col : columns.Logical()) {
+			auto projected = alias.GetIdentifierName() + "__" + col.Name().GetIdentifierName();
+			if (!projected_names.insert(projected).second) {
+				return false;
+			}
 			vector<Identifier> qualified {alias, col.Name()};
 			auto col_ref = make_uniq<ColumnRefExpression>(std::move(qualified));
-			col_ref->SetAlias(Identifier(alias.GetIdentifierName() + "__" + col.Name().GetIdentifierName()));
+			col_ref->SetAlias(Identifier(projected));
 			projection.push_back(std::move(col_ref));
 		}
 	}
@@ -805,7 +861,9 @@ static bool IsKnownAggregateName(const FunctionExpression &func) {
 	       name == "favg" || name == "regr_slope" || name == "regr_intercept" || name == "regr_count";
 }
 
-bool RemotePushdownOptimizer::DecomposeAggregate(const FunctionExpression &agg, string &merge_function) {
+bool RemotePushdownOptimizer::DecomposeAggregate(const FunctionExpression &agg, string &merge_function,
+                                                bool &zero_default) {
+	zero_default = false;
 	// DISTINCT breaks additivity: summing per-group distinct counts double-counts any value
 	// that appears under more than one group key. FILTER / ORDER BY / export_state change the
 	// aggregate's meaning in ways the two-phase form does not reproduce.
@@ -821,6 +879,13 @@ bool RemotePushdownOptimizer::DecomposeAggregate(const FunctionExpression &agg, 
 	if (name == "sum" || name == "count" || name == "count_star" || name == "sum_no_overflow") {
 		// Partial sums and counts are combined by summing
 		merge_function = "sum";
+		// COUNT and SUM differ on empty input, and the difference survives the rewrite. When a
+		// pushed filter eliminates every row the fragment returns no rows at all, so the master's
+		// SUM sees an empty input and yields NULL. That is right for SUM but wrong for COUNT,
+		// which must be 0 - an ungrouped aggregate emits one row for the implicit group whether
+		// or not any input row survived. So the count family carries a zero default and SUM
+		// deliberately does not.
+		zero_default = (name == "count" || name == "count_star");
 		return true;
 	}
 	if (name == "min" || name == "max") {
@@ -859,12 +924,14 @@ bool RemotePushdownOptimizer::CollectPushableAggregates(const ParsedExpression &
 				return false;
 			}
 			string merge_function;
-			if (!DecomposeAggregate(func, merge_function)) {
+			bool zero_default = false;
+			if (!DecomposeAggregate(func, merge_function, zero_default)) {
 				return false;
 			}
 			PartialAggregate agg;
 			agg.original = &expr;
 			agg.merge_function = std::move(merge_function);
+			agg.zero_default = zero_default;
 			agg.partial_name = Identifier("__fedagg_" + std::to_string(counter++));
 			agg.partial = func.Copy();
 			out.push_back(std::move(agg));
@@ -923,19 +990,31 @@ bool RemotePushdownOptimizer::NodeHasWindow(const SelectNode &node) {
 	return false;
 }
 
-void RemotePushdownOptimizer::AddGroupColumn(vector<GroupColumn> &out, const Identifier &alias,
+bool RemotePushdownOptimizer::AddGroupColumn(vector<GroupColumn> &out, const Identifier &alias,
                                              const Identifier &column) {
 	// Record once, preserving first-seen order so the fragment's projection is deterministic
 	for (auto &existing : out) {
 		if (existing.alias == alias && existing.column == column) {
-			return;
+			return true;
+		}
+	}
+	auto projected = Identifier(alias.GetIdentifierName() + "__" + column.GetIdentifierName());
+	// alias__column is not injective: alias `o` column `x__y` and alias `o__x` column `y` both
+	// produce o__x__y. Projecting the name twice makes the second silently shadow the first, so
+	// the master reads one column's values under the other's name. Decline the side instead -
+	// the caller falls back to pushing each table separately, which is correct and only loses
+	// the grouping optimization for this query.
+	for (auto &existing : out) {
+		if (existing.projected_name == projected) {
+			return false;
 		}
 	}
 	GroupColumn col;
 	col.alias = alias;
 	col.column = column;
-	col.projected_name = Identifier(alias.GetIdentifierName() + "__" + column.GetIdentifierName());
+	col.projected_name = std::move(projected);
 	out.push_back(std::move(col));
+	return true;
 }
 
 bool RemotePushdownOptimizer::CollectPushedColumns(const ParsedExpression &expr,
@@ -959,7 +1038,10 @@ bool RemotePushdownOptimizer::CollectPushedColumns(const ParsedExpression &expr,
 		}
 		auto &qualifier = names[names.size() - 2];
 		if (pushed_aliases.find(qualifier) != pushed_aliases.end()) {
-			AddGroupColumn(out, qualifier, names.back());
+			// A projected-name collision disqualifies the side; see AddGroupColumn
+			if (!AddGroupColumn(out, qualifier, names.back())) {
+				return false;
+			}
 		}
 		return true;
 	}
@@ -1113,7 +1195,21 @@ void RemotePushdownOptimizer::ApplyPartialAggregatesInExpression(unique_ptr<Pars
 		vector<Identifier> qualified {fragment_alias, agg.partial_name};
 		vector<unique_ptr<ParsedExpression>> children;
 		children.push_back(make_uniq<ColumnRefExpression>(std::move(qualified)));
-		auto merged = make_uniq<FunctionExpression>(Identifier(agg.merge_function), std::move(children));
+		unique_ptr<ParsedExpression> merged =
+		    make_uniq<FunctionExpression>(Identifier(agg.merge_function), std::move(children));
+		if (agg.zero_default) {
+			// COUNT(*) becomes COALESCE(sum(__fed_aN.__fedagg_0), 0). Without this an ungrouped
+			// count whose fragment returned no rows yields NULL, because the merge is SUM. The
+			// coalesce is a no-op whenever any partial row exists, so it only affects the empty
+			// case it exists for.
+			//
+			// COALESCE is an operator in DuckDB, not a catalog scalar function - building it as a
+			// FunctionExpression fails to bind with "Scalar Function with name coalesce does not exist".
+			auto coalesce = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
+			coalesce->GetChildrenMutable().push_back(std::move(merged));
+			coalesce->GetChildrenMutable().push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
+			merged = std::move(coalesce);
+		}
 		// Keep the original output name so the result column is unchanged
 		merged->SetAlias(expr->GetAlias());
 		expr = std::move(merged);

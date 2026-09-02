@@ -205,12 +205,17 @@ private:
 	static void CollectTableAliases(const TableRef &ref, identifier_set_t &aliases);
 	//! True when every column reference in expr is qualified by an alias in aliases, there is at
 	//! least one such reference, and the expression is safe to evaluate remotely.
-	static bool CanPushConjunctTo(const ParsedExpression &expr, const identifier_set_t &aliases);
+	//! Not static: needs the catalog to test function volatility.
+	bool CanPushConjunctTo(const ParsedExpression &expr, const identifier_set_t &aliases);
+	//! True when expr calls a function that may be volatile. A pushed conjunct is also retained
+	//! in the master's WHERE, so a volatile predicate would be evaluated twice with independent
+	//! results - pushing one is never safe.
+	bool ContainsVolatileFunction(const ParsedExpression &expr);
 	//! Split a conjunctive predicate into its AND-separated conjuncts (no ownership transfer).
 	static void CollectConjuncts(ParsedExpression &expr, vector<reference<ParsedExpression>> &conjuncts);
 	//! Build the AND of every conjunct in where_clause that can be pushed to aliases, or nullptr.
-	static unique_ptr<ParsedExpression> BuildPushableFilter(optional_ptr<ParsedExpression> where_clause,
-	                                                        const identifier_set_t &aliases);
+	unique_ptr<ParsedExpression> BuildPushableFilter(optional_ptr<ParsedExpression> where_clause,
+	                                                 const identifier_set_t &aliases);
 	//! Push each single-remote side of a cross-catalog join, carrying the WHERE conjuncts that
 	//! only reference that side. Called from RewriteNode(SelectNode) where the WHERE is visible.
 	//! Only pending entries at or after pending_base are processed.
@@ -246,6 +251,11 @@ private:
 		unique_ptr<ParsedExpression> partial;
 		//! sum / min / max - the function that combines partials at the master
 		string merge_function;
+		//! True for the COUNT family, where the merge needs a zero default. COUNT over no rows
+		//! is 0, but the merge is SUM, and SUM over no partial rows is NULL - so the master
+		//! wraps the merge in COALESCE(..., 0). Only the count family: SUM over an empty input
+		//! is legitimately NULL and must stay NULL.
+		bool zero_default = false;
 		//! Name the partial is projected under in the fragment (__fedagg_N)
 		Identifier partial_name;
 	};
@@ -273,8 +283,9 @@ private:
 	//! silent, so every uncertain case declines.
 	bool PlanPartialAggregate(const SelectNode &node, const identifier_set_t &pushed_aliases,
 	                          PartialAggregatePlan &plan);
-	//! Classify an aggregate: sets merge_function when it decomposes, returns false otherwise.
-	static bool DecomposeAggregate(const FunctionExpression &agg, string &merge_function);
+	//! Classify an aggregate: sets merge_function, and zero_default for the COUNT family,
+	//! when it decomposes. Returns false otherwise.
+	static bool DecomposeAggregate(const FunctionExpression &agg, string &merge_function, bool &zero_default);
 	//! Collect the aggregates to push, descending through ordinary functions but not into an
 	//! aggregate's arguments. Returns false when an aggregate must not be pushed.
 	static bool CollectPushableAggregates(const ParsedExpression &expr, const identifier_set_t &pushed_aliases,
@@ -285,7 +296,9 @@ private:
 	//! True if the node contains a window function, which needs per-row detail
 	static bool NodeHasWindow(const SelectNode &node);
 	//! Record a pushed-side column once, preserving first-seen order
-	static void AddGroupColumn(vector<GroupColumn> &out, const Identifier &alias, const Identifier &column);
+	//! Returns false when alias__column collides with an already-recorded pair, which
+	//! disqualifies the side rather than silently projecting the same name twice.
+	static bool AddGroupColumn(vector<GroupColumn> &out, const Identifier &alias, const Identifier &column);
 	//! Collect (alias, column) for every pushed-side column reference in expr, skipping the
 	//! aggregate subtrees listed in plan. Returns false on a reference that cannot be
 	//! represented as a plain qualified column.
@@ -305,7 +318,9 @@ private:
 	static void PreserveSelectListNames(SelectNode &node);
 	//! Drop every conjunct that was pushed into the fragment. Unlike a plain scan pushdown the
 	//! predicate cannot stay at the master: aggregation has removed the columns it references.
-	static void RemovePushedConjuncts(SelectNode &node, const identifier_set_t &pushed_aliases);
+	//! Not static: shares CanPushConjunctTo with BuildPushableFilter so the set of conjuncts
+	//! removed here is exactly the set that travelled.
+	void RemovePushedConjuncts(SelectNode &node, const identifier_set_t &pushed_aliases);
 	//! Wrap a table ref that produces a remote statement's result into "SELECT * FROM <ref>"
 	static unique_ptr<SelectStatement> WrapRemoteRef(unique_ptr<TableRef> ref);
 
