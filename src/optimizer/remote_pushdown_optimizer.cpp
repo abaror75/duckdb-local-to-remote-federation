@@ -13,6 +13,8 @@
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/query_node/delete_query_node.hpp"
 #include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/merge_query_node.hpp"
@@ -376,6 +378,10 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(RecursiveCTENode &nod
 }
 
 CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(SelectNode &node) {
+	// Cross-catalog join sides recorded while rewriting our FROM clause are pushed at the end of
+	// this function. Remember where our own entries begin so nested scopes stay independent.
+	const auto pending_join_sides_base = pushdown_state.pending_join_sides.size();
+
 	auto from_result = CatalogPushdownResult::NoCatalogReference();
 	if (node.from_table) {
 		from_result = Rewrite(node.from_table);
@@ -434,7 +440,156 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(SelectNode &node) {
 			break;
 		}
 	}
+
+	// The whole node could not be pushed to one catalog, so push the individual single-remote
+	// join sides recorded above, each carrying the WHERE conjuncts that only reference it.
+	if (result.reference_type != CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
+		PushCrossCatalogJoinSides(node, pending_join_sides_base);
+	}
+	pushdown_state.pending_join_sides.resize(pending_join_sides_base);
+
 	return result;
+}
+
+void RemotePushdownOptimizer::CollectTableAliases(const TableRef &ref, identifier_set_t &aliases) {
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base = ref.Cast<BaseTableRef>();
+		aliases.insert(base.alias.empty() ? base.Table() : base.alias);
+		break;
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		if (join.left) {
+			CollectTableAliases(*join.left, aliases);
+		}
+		if (join.right) {
+			CollectTableAliases(*join.right, aliases);
+		}
+		break;
+	}
+	case TableReferenceType::TABLE_FUNCTION: {
+		auto &func = ref.Cast<TableFunctionRef>();
+		if (!func.alias.empty()) {
+			aliases.insert(func.alias);
+		} else if (func.function) {
+			aliases.insert(func.function->Cast<FunctionExpression>().FunctionName());
+		}
+		break;
+	}
+	default:
+		// Subqueries, expression lists and everything else expose exactly their alias
+		if (!ref.alias.empty()) {
+			aliases.insert(ref.alias);
+		}
+		break;
+	}
+}
+
+void RemotePushdownOptimizer::CollectConjuncts(ParsedExpression &expr,
+                                               vector<reference<ParsedExpression>> &conjuncts) {
+	if (expr.GetExpressionClass() == ExpressionClass::CONJUNCTION) {
+		auto &conj = expr.Cast<ConjunctionExpression>();
+		if (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			for (auto &child : conj.GetChildrenMutable()) {
+				CollectConjuncts(*child, conjuncts);
+			}
+			return;
+		}
+	}
+	conjuncts.push_back(expr);
+}
+
+bool RemotePushdownOptimizer::CanPushConjunctTo(const ParsedExpression &expr, const identifier_set_t &aliases) {
+	// A subquery may correlate to the other side of the join or to a local table
+	if (expr.HasSubquery()) {
+		return false;
+	}
+	// WHERE cannot legally contain these, but a malformed tree must not be shipped
+	if (expr.IsAggregate() || expr.IsWindow()) {
+		return false;
+	}
+	// Every column reference has to be explicitly qualified by a table on this side. An
+	// unqualified reference cannot be attributed to a side here (binding has not happened yet),
+	// so such conjuncts stay at the master.
+	bool all_columns_local = true;
+	bool saw_column = false;
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expr, [&](const ColumnRefExpression &col_ref) {
+		saw_column = true;
+		auto &names = col_ref.ColumnNames();
+		if (names.size() < 2) {
+			all_columns_local = false;
+			return;
+		}
+		// names is catalog.schema.table.column with optional leading parts - the qualifier
+		// directly in front of the column name is what an alias matches
+		if (aliases.find(names[names.size() - 2]) == aliases.end()) {
+			all_columns_local = false;
+		}
+	});
+	// A conjunct with no column reference at all is a constant predicate - leave it at the master
+	return saw_column && all_columns_local;
+}
+
+unique_ptr<ParsedExpression> RemotePushdownOptimizer::BuildPushableFilter(optional_ptr<ParsedExpression> where_clause,
+                                                                         const identifier_set_t &aliases) {
+	if (!where_clause) {
+		return nullptr;
+	}
+	vector<reference<ParsedExpression>> conjuncts;
+	CollectConjuncts(*where_clause, conjuncts);
+
+	unique_ptr<ParsedExpression> filter;
+	for (auto &conjunct : conjuncts) {
+		if (!CanPushConjunctTo(conjunct.get(), aliases)) {
+			continue;
+		}
+		// A copy is pushed and the original stays in the master's WHERE. Re-applying the
+		// predicate to the already reduced result is a no-op for inner joins, and for outer
+		// joins the master's WHERE is what removes the NULL-extended rows, so it must remain.
+		auto copy = conjunct.get().Copy();
+		if (!filter) {
+			filter = std::move(copy);
+		} else {
+			filter = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(filter),
+			                                         std::move(copy));
+		}
+	}
+	return filter;
+}
+
+//! Push every base table under a remote join subtree individually. A subtree that binds more
+//! than one table cannot be replaced by a single remote scan: the scan carries one alias, while
+//! the enclosing join still qualifies its columns with each original alias (o.x, oi.y). Pushing
+//! the tables one at a time keeps every alias bindable. Each table still gets its own filter, so
+//! the row reduction happens at the source either way - only the join itself moves to the master.
+void RemotePushdownOptimizer::PushRemoteSubtreeTables(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
+                                                     SelectNode &node) {
+	if (!ref) {
+		return;
+	}
+	if (ref->type == TableReferenceType::JOIN) {
+		auto &join = ref->Cast<JoinRef>();
+		PushRemoteSubtreeTables(join.left, result, node);
+		PushRemoteSubtreeTables(join.right, result, node);
+		return;
+	}
+	identifier_set_t aliases;
+	CollectTableAliases(*ref, aliases);
+	auto filter = BuildPushableFilter(node.where_clause.get(), aliases);
+	FinishPushdown(ref, result, std::move(filter));
+}
+
+void RemotePushdownOptimizer::PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base) {
+	// Only the entries this SelectNode recorded - earlier ones belong to enclosing scopes
+	auto &pending_sides = pushdown_state.pending_join_sides;
+	for (idx_t i = pending_base; i < pending_sides.size(); i++) {
+		auto &pending = pending_sides[i];
+		if (!pending.ref_slot || !*pending.ref_slot) {
+			continue;
+		}
+		PushRemoteSubtreeTables(*pending.ref_slot, pending.result, node);
+	}
 }
 
 CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(InsertQueryNode &node) {
@@ -959,15 +1114,22 @@ CatalogPushdownResult RemotePushdownOptimizer::Rewrite(JoinRef &ref) {
 
 	auto result = Merge(left_result, right_result);
 
-	// For cross-catalog joins (different remote catalogs, or one remote + one local),
-	// push each single-remote subtree independently so the join executes at master
-	// with pre-fetched Arrow results from each source.
+	// For cross-catalog joins (different remote catalogs, or one remote + one local), each
+	// single-remote subtree can be pushed to its own source and the join then runs at the
+	// master over the returned results. Only record the candidates here: the enclosing
+	// WHERE clause is not visible yet, and pushing without it would ask each source for its
+	// entire table. RewriteNode(SelectNode) performs the actual pushdown once it can attach
+	// the conjuncts that belong to each side.
 	if (result.reference_type == CatalogReferenceType::UNKNOWN_CATALOG_REFERENCE) {
 		if (left_result.reference_type == CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
-			FinishPushdown(ref.left, left_result);
+			PendingRemoteJoinSide pending {&ref.left, left_result, {}};
+			CollectTableAliases(*ref.left, pending.aliases);
+			pushdown_state.pending_join_sides.push_back(std::move(pending));
 		}
 		if (right_result.reference_type == CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
-			FinishPushdown(ref.right, right_result);
+			PendingRemoteJoinSide pending {&ref.right, right_result, {}};
+			CollectTableAliases(*ref.right, pending.aliases);
+			pushdown_state.pending_join_sides.push_back(std::move(pending));
 		}
 	}
 
@@ -1914,16 +2076,33 @@ void RemotePushdownOptimizer::FinishPushdown(unique_ptr<QueryNode> &node, Catalo
 	node = std::move(select_node);
 }
 
-void RemotePushdownOptimizer::FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result) {
+void RemotePushdownOptimizer::FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
+                                            unique_ptr<ParsedExpression> filter) {
 	if (result.reference_type != CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
 		return;
 	}
-	// Wrap the table ref in SELECT * FROM <ref>, strip the catalog prefix, then push to remote.
+	// Preserve the alias the query used to reference this table, otherwise column
+	// references like "o.customer_id" cannot bind against the replacement ref.
+	// With no explicit alias the table name itself acts as the alias.
+	Identifier effective_alias = ref->alias;
+	if (effective_alias.empty() && ref->type == TableReferenceType::BASE_TABLE) {
+		effective_alias = ref->Cast<BaseTableRef>().Table();
+	}
+	auto column_aliases = ref->column_name_alias;
+
+	// Wrap the table ref in SELECT * FROM <ref> [WHERE <filter>], strip the catalog prefix,
+	// then push to remote. Carrying the filter lets the source do the row reduction instead
+	// of returning the whole table for the master to filter.
 	auto select_node = make_uniq<SelectNode>();
 	select_node->select_list.push_back(make_uniq<StarExpression>());
 	select_node->from_table = std::move(ref);
+	select_node->where_clause = std::move(filter);
 	StripCatalogName(*select_node, result.catalog->GetName());
 	ref = CreateRemoteFunctionRef(result, std::move(select_node));
+	if (ref) {
+		ref->alias = std::move(effective_alias);
+		ref->column_name_alias = std::move(column_aliases);
+	}
 }
 
 } // namespace duckdb

@@ -77,10 +77,25 @@ struct ExpressionPushdownResult {
 	ExpressionFoldability foldability = ExpressionFoldability::NOT_FOLDABLE;
 };
 
+//! A join side that resolves to a single remote catalog while the join as a whole does not.
+//! Recorded while rewriting the FROM clause and pushed later from RewriteNode(SelectNode),
+//! where the WHERE clause is available and its conjuncts can travel with the fragment.
+struct PendingRemoteJoinSide {
+	//! The slot inside the owning JoinRef to overwrite with the remote scan
+	unique_ptr<TableRef> *ref_slot;
+	//! Which remote catalog this side belongs to
+	CatalogPushdownResult result;
+	//! Table aliases visible under this side, used to decide which conjuncts may be pushed
+	identifier_set_t aliases;
+};
+
 struct RemotePushdownState {
 	bool search_path_initialized = false;
 	vector<reference<Catalog>> remote_catalogs_in_search_path;
 	vector<CatalogSearchEntry> local_catalogs_in_search_path;
+	//! Cross-catalog join sides awaiting pushdown, shared across parent/child optimizers so a
+	//! nested join on the right-hand side (analyzed by a child optimizer) is not lost
+	vector<PendingRemoteJoinSide> pending_join_sides;
 };
 
 class RemotePushdownOptimizer {
@@ -178,8 +193,28 @@ private:
 
 	void FinishPushdown(unique_ptr<SQLStatement> &statement, CatalogPushdownResult result);
 	void FinishPushdown(unique_ptr<QueryNode> &node, CatalogPushdownResult result);
-	//! Push a single TableRef to its remote catalog (used for cross-catalog joins)
-	void FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result);
+	//! Push a single TableRef to its remote catalog (used for cross-catalog joins).
+	//! When filter is set it becomes the WHERE clause of the pushed "SELECT * FROM <ref>",
+	//! so the remote side does the row reduction instead of shipping the whole table.
+	void FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
+	                    unique_ptr<ParsedExpression> filter = nullptr);
+
+	//! Collect the table aliases (or table names when unaliased) visible under a TableRef subtree.
+	static void CollectTableAliases(const TableRef &ref, identifier_set_t &aliases);
+	//! True when every column reference in expr is qualified by an alias in aliases, there is at
+	//! least one such reference, and the expression is safe to evaluate remotely.
+	static bool CanPushConjunctTo(const ParsedExpression &expr, const identifier_set_t &aliases);
+	//! Split a conjunctive predicate into its AND-separated conjuncts (no ownership transfer).
+	static void CollectConjuncts(ParsedExpression &expr, vector<reference<ParsedExpression>> &conjuncts);
+	//! Build the AND of every conjunct in where_clause that can be pushed to aliases, or nullptr.
+	static unique_ptr<ParsedExpression> BuildPushableFilter(optional_ptr<ParsedExpression> where_clause,
+	                                                        const identifier_set_t &aliases);
+	//! Push each single-remote side of a cross-catalog join, carrying the WHERE conjuncts that
+	//! only reference that side. Called from RewriteNode(SelectNode) where the WHERE is visible.
+	//! Only pending entries at or after pending_base are processed.
+	void PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base);
+	//! Push every base table under a remote subtree individually, so each keeps its own alias.
+	void PushRemoteSubtreeTables(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
 	//! Wrap a table ref that produces a remote statement's result into "SELECT * FROM <ref>"
 	static unique_ptr<SelectStatement> WrapRemoteRef(unique_ptr<TableRef> ref);
 
