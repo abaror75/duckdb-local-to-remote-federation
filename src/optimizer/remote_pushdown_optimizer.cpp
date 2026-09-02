@@ -958,6 +958,19 @@ CatalogPushdownResult RemotePushdownOptimizer::Rewrite(JoinRef &ref) {
 	auto right_result = child_optimizer.Rewrite(ref.right);
 
 	auto result = Merge(left_result, right_result);
+
+	// For cross-catalog joins (different remote catalogs, or one remote + one local),
+	// push each single-remote subtree independently so the join executes at master
+	// with pre-fetched Arrow results from each source.
+	if (result.reference_type == CatalogReferenceType::UNKNOWN_CATALOG_REFERENCE) {
+		if (left_result.reference_type == CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
+			FinishPushdown(ref.left, left_result);
+		}
+		if (right_result.reference_type == CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
+			FinishPushdown(ref.right, right_result);
+		}
+	}
+
 	// Also analyze the join condition - it may contain subqueries or local macro calls
 	// that affect whether the join can be pushed as a whole.
 	if (ref.condition) {
@@ -1899,6 +1912,18 @@ void RemotePushdownOptimizer::FinishPushdown(unique_ptr<QueryNode> &node, Catalo
 	select_node->select_list.push_back(make_uniq<StarExpression>());
 	select_node->from_table = CreateRemoteFunctionRef(result, std::move(node));
 	node = std::move(select_node);
+}
+
+void RemotePushdownOptimizer::FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result) {
+	if (result.reference_type != CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
+		return;
+	}
+	// Wrap the table ref in SELECT * FROM <ref>, strip the catalog prefix, then push to remote.
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<StarExpression>());
+	select_node->from_table = std::move(ref);
+	StripCatalogName(*select_node, result.catalog->GetName());
+	ref = CreateRemoteFunctionRef(result, std::move(select_node));
 }
 
 } // namespace duckdb

@@ -178,6 +178,8 @@ private:
 
 	void FinishPushdown(unique_ptr<SQLStatement> &statement, CatalogPushdownResult result);
 	void FinishPushdown(unique_ptr<QueryNode> &node, CatalogPushdownResult result);
+	//! Push a single TableRef to its remote catalog (used for cross-catalog joins)
+	void FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result);
 	//! Wrap a table ref that produces a remote statement's result into "SELECT * FROM <ref>"
 	static unique_ptr<SelectStatement> WrapRemoteRef(unique_ptr<TableRef> ref);
 
