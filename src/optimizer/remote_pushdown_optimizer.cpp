@@ -932,8 +932,27 @@ bool RemotePushdownOptimizer::CollectPushableAggregates(const ParsedExpression &
 			agg.original = &expr;
 			agg.merge_function = std::move(merge_function);
 			agg.zero_default = zero_default;
-			agg.partial_name = Identifier("__fedagg_" + std::to_string(counter++));
 			agg.partial = func.Copy();
+			// The same aggregate is often written twice - once in the select list and again in
+			// HAVING or ORDER BY. Both occurrences need their own entry, because the replacement
+			// pass finds them by identity, but they can share one fragment column instead of
+			// computing and shipping the partial twice.
+			//
+			// Equality is ParsedExpression::Equals rather than a ToString() comparison: it walks
+			// the tree and compares the qualified name, the arguments, DISTINCT, FILTER and ORDER
+			// BY, while ignoring the alias. So "sum(o.amt) AS s" in the select list matches the
+			// bare "sum(o.amt)" in HAVING, which a text comparison would not, and it cannot be
+			// fooled by two different trees that happen to render alike.
+			for (auto &existing : out) {
+				if (existing.partial->Equals(*agg.partial)) {
+					agg.partial_name = existing.partial_name;
+					agg.projected = false;
+					break;
+				}
+			}
+			if (agg.projected) {
+				agg.partial_name = Identifier("__fedagg_" + std::to_string(counter++));
+			}
 			out.push_back(std::move(agg));
 			return true;
 		}
@@ -1307,6 +1326,10 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeAggregated(unique_ptr<TableRef> &
 		group_expressions.push_back(make_uniq<ColumnRefExpression>(std::move(qualified)));
 	}
 	for (auto &agg : plan.aggregates) {
+		if (!agg.projected) {
+			// A repeat of an aggregate already in the projection; both merge the same column
+			continue;
+		}
 		auto partial = agg.partial->Copy();
 		partial->SetAlias(agg.partial_name);
 		projection.push_back(std::move(partial));

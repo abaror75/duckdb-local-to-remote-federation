@@ -258,6 +258,11 @@ private:
 		bool zero_default = false;
 		//! Name the partial is projected under in the fragment (__fedagg_N)
 		Identifier partial_name;
+		//! False when an earlier entry already plans an identical partial - the same aggregate
+		//! written twice, typically once in the select list and once in HAVING. The fragment
+		//! projects the column once and every occurrence merges that one column, so only the
+		//! first entry of a group carries the projection.
+		bool projected = true;
 	};
 	//! A pushed-side column that must survive aggregation because something above references it
 	struct GroupColumn {
