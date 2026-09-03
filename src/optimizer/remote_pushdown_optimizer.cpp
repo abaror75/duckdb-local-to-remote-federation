@@ -1102,6 +1102,45 @@ bool RemotePushdownOptimizer::CollectPushedColumnsInTableRef(const TableRef &ref
 	return true;
 }
 
+void RemotePushdownOptimizer::CollectSelectListAliases(const SelectNode &node,
+                                                       identifier_map_t<const ParsedExpression *> &out) {
+	// The same loop BindSelectNode runs to fill SelectBindState::alias_map: only an explicit
+	// alias counts, and a repeated alias overwrites the earlier entry, because the last one is
+	// what ORDER BY binds to.
+	for (auto &expr : node.select_list) {
+		if (expr->GetAlias().empty()) {
+			continue;
+		}
+		out[expr->GetAlias()] = expr.get();
+	}
+}
+
+const ParsedExpression &
+RemotePushdownOptimizer::ResolveOrderByAlias(const ParsedExpression &expr,
+                                             const identifier_map_t<const ParsedExpression *> &select_aliases) {
+	if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return expr;
+	}
+	auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+	// Only the ORDER BY entry itself, and only a bare one-part name. OrderBinder::Bind consults
+	// the select list before qualifying anything, so there an alias beats a table column of the
+	// same name - but only for an entry that IS the column reference. A reference nested inside
+	// a larger expression takes the general path, which qualifies first, so the table column
+	// wins instead. Resolving one with the other's rule would silently reorder the result.
+	if (names.size() != 1) {
+		return expr;
+	}
+	auto entry = select_aliases.find(names[0]);
+	if (entry == select_aliases.end()) {
+		// A genuinely unqualified column, which still cannot be attributed to a side here
+		return expr;
+	}
+	// One step, as the binder does: the aliased expression is attributed by the ordinary rules
+	// and its own names are not resolved as aliases again. So `SELECT a + 1 AS a ORDER BY a`
+	// lands on `a + 1` and the `a` inside it is treated as a column, and resolution cannot cycle.
+	return *entry->second;
+}
+
 bool RemotePushdownOptimizer::PlanPartialAggregate(const SelectNode &node, const identifier_set_t &pushed_aliases,
                                                   PartialAggregatePlan &plan) {
 	// GROUPING SETS / ROLLUP / CUBE produce several groupings at once; the two-phase rewrite
@@ -1161,10 +1200,16 @@ bool RemotePushdownOptimizer::PlanPartialAggregate(const SelectNode &node, const
 	if (node.having && !CollectPushedColumns(*node.having, pushed_aliases, plan.aggregates, plan.group_columns)) {
 		return false;
 	}
+	// An ORDER BY entry naming one of this select list's own aliases is not a column at all, so
+	// it is resolved before attribution. The columns that decide the side are the aliased
+	// expression's, and every select-list expression has already been walked above.
+	identifier_map_t<const ParsedExpression *> select_aliases;
+	CollectSelectListAliases(node, select_aliases);
 	for (auto &modifier : node.modifiers) {
 		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
 			for (auto &order : modifier->Cast<OrderModifier>().orders) {
-				if (!CollectPushedColumns(*order.expression, pushed_aliases, plan.aggregates, plan.group_columns)) {
+				auto &target = ResolveOrderByAlias(*order.expression, select_aliases);
+				if (!CollectPushedColumns(target, pushed_aliases, plan.aggregates, plan.group_columns)) {
 					return false;
 				}
 			}

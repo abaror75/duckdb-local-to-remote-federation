@@ -312,6 +312,14 @@ private:
 	//! Same, over every join condition and USING clause in a FROM tree
 	static bool CollectPushedColumnsInTableRef(const TableRef &ref, const identifier_set_t &pushed_aliases,
 	                                           const vector<PartialAggregate> &aggregates, vector<GroupColumn> &out);
+	//! Map each select-list alias to the expression it names, the way BindSelectNode builds
+	//! SelectBindState::alias_map - a repeated alias resolves to the last entry that carries it
+	static void CollectSelectListAliases(const SelectNode &node, identifier_map_t<const ParsedExpression *> &out);
+	//! Resolve an ORDER BY entry that is a bare select-list alias to the expression it names,
+	//! or return the entry unchanged when it is not one. Attribution then proceeds on the
+	//! aliased expression's own columns
+	static const ParsedExpression &
+	ResolveOrderByAlias(const ParsedExpression &expr, const identifier_map_t<const ParsedExpression *> &select_aliases);
 	//! Replace each planned aggregate with its merge over the fragment's partial column
 	static void ApplyPartialAggregates(SelectNode &node, const PartialAggregatePlan &plan,
 	                                   const Identifier &fragment_alias);
