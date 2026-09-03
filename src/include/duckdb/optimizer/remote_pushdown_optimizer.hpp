@@ -96,6 +96,8 @@ struct RemotePushdownState {
 	//! Cross-catalog join sides awaiting pushdown, shared across parent/child optimizers so a
 	//! nested join on the right-hand side (analyzed by a child optimizer) is not lost
 	vector<PendingRemoteJoinSide> pending_join_sides;
+	//! Names the alias of each grouped multi-table fragment (__fed_j0, __fed_j1, ...)
+	idx_t grouped_fragment_counter = 0;
 	//! Incremented whenever a table reference resolves to a CTE. A CTE body may live entirely in
 	//! one remote catalog, which classifies a reference to it as remotely pushable, but the CTE
 	//! *name* only exists in the enclosing statement. Whole-statement pushdown carries the WITH
@@ -224,6 +226,24 @@ private:
 	//! only reference that side. Called from RewriteNode(SelectNode) where the WHERE is visible.
 	//! Only pending entries at or after pending_base are processed.
 	void PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base);
+	//! Push a remote subtree that binds several tables as ONE fragment, so the join between
+	//! them executes at the source. Returns false when the grouped form cannot be built (an
+	//! unresolvable column list, a non-base-table leaf, ...) and the caller should fall back
+	//! to pushing the leaves individually.
+	bool PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
+	//! Collect the base tables under a subtree together with the alias each is bound to.
+	//! Returns false if the subtree contains anything other than base tables and inner joins.
+	static bool CollectGroupableBaseTables(TableRef &ref,
+	                                       vector<std::pair<Identifier, reference<BaseTableRef>>> &tables);
+	//! Rewrite every "alias.column" in the enclosing node to "fragment_alias.alias__column"
+	//! so it binds against the flattened, prefix-projected remote result.
+	static void RequalifyColumnRefs(SelectNode &node, const identifier_set_t &pushed_aliases,
+	                                const Identifier &fragment_alias);
+	static void RequalifyColumnRefsInExpression(unique_ptr<ParsedExpression> &expr,
+	                                            const identifier_set_t &pushed_aliases,
+	                                            const Identifier &fragment_alias);
+	static void RequalifyColumnRefsInTableRef(TableRef &ref, const identifier_set_t &pushed_aliases,
+	                                          const Identifier &fragment_alias);
 	//! Push every base table under a remote subtree individually, so each keeps its own alias.
 	void PushRemoteSubtreeTables(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
 	//! Wrap a table ref that produces a remote statement's result into "SELECT * FROM <ref>"
