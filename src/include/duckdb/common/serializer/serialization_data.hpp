@@ -33,10 +33,15 @@ struct SerializationData {
 	// forward-declared.
 	SerializationData();
 	SerializationData(const SerializationData &);
-	SerializationData(SerializationData &&) noexcept;
 	SerializationData &operator=(const SerializationData &);
-	SerializationData &operator=(SerializationData &&) noexcept;
 	~SerializationData();
+
+	// Defaulted here so the compiler derives the exception specifications from the members. stack is backed by
+	// std::deque, whose move constructor allocates a node map and so is potentially-throwing, meaning the guarantee
+	// cannot be stated unconditionally. These two need only the members' declarations, not CompressionInfo's
+	// definition.
+	SerializationData(SerializationData &&) = default;
+	SerializationData &operator=(SerializationData &&) = default;
 
 	stack<reference<ClientContext>> contexts;
 	stack<reference<DatabaseInstance>> databases;

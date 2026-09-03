@@ -8,9 +8,7 @@ namespace duckdb {
 
 SerializationData::SerializationData() = default;
 SerializationData::SerializationData(const SerializationData &) = default;
-SerializationData::SerializationData(SerializationData &&) noexcept = default;
 SerializationData &SerializationData::operator=(const SerializationData &) = default;
-SerializationData &SerializationData::operator=(SerializationData &&) noexcept = default;
 SerializationData::~SerializationData() = default;
 
 } // namespace duckdb
