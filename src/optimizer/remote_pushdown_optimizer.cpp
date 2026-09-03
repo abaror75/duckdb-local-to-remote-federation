@@ -12,6 +12,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -802,8 +803,679 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 	ref->alias = fragment_alias;
 
 	// The enclosing query still says o.x / oi.y - point those at the flattened result
+	PreserveSelectListNames(node);
 	RequalifyColumnRefs(node, pushed_aliases, fragment_alias);
 	return true;
+}
+
+//===--------------------------------------------------------------------===//
+// Partial aggregate pushdown
+//===--------------------------------------------------------------------===//
+//
+// When an aggregate's inputs all come from one remote side, that side can group by the
+// columns referenced above it and return partial aggregates instead of raw rows. A query
+// scanning millions of rows to produce a handful then ships one row per group.
+//
+// Validity (Yan & Larson eager aggregation). For an equi-join on key k, take a group key
+// value with a_k rows on the pushed side and b_k on the other. The original produces
+// a_k * b_k pairs; pre-aggregating produces one fragment row per k which the join then
+// duplicates b_k times. So the merge sees the partial b_k times:
+//
+//   SUM      original SUM(x) over pairs = b_k * SUM(x over a_k)
+//            merged   SUM(partial) over b_k copies = b_k * SUM(x over a_k)   equal
+//   COUNT(*) original a_k * b_k;  merged SUM(a_k) over b_k copies = a_k * b_k   equal
+//   MIN/MAX  idempotent under duplication                                    equal
+//
+// The duplication factor cancels because it applies uniformly to every row of the group.
+// That argument fails for anything not additive-or-idempotent, and for aggregates over the
+// OTHER side: SUM(b.x) originally counts each b row a_k times, but after collapsing the
+// pushed side it is counted once. Such aggregates therefore decline.
+//
+// NULLs survive: SUM of an all-NULL group is NULL and SUM ignores NULL partials; COUNT(x)
+// counts non-NULL and sums correctly; MIN/MAX ignore NULL.
+//
+// COUNT(DISTINCT x) does NOT decompose. SUM(COUNT(DISTINCT x) per k) double-counts any x
+// appearing under two different k. Grouping the fragment by (k, x) instead would preserve
+// the distinct values, but yields one row per distinct pair - no reduction when x is
+// near-unique per k - so it is not worth shipping and is declined outright.
+
+//! Aggregates this rewrite recognises. Detection is by name because at this stage the tree is
+//! unbound: ParsedExpression::IsAggregate() only recurses into children and no FunctionExpression
+//! overrides it, so nothing here knows that "sum" is an aggregate rather than a scalar function.
+//! Only unqualified names match, so a schema-qualified user aggregate never does.
+static bool IsKnownAggregateName(const FunctionExpression &func) {
+	if (!func.GetQualifiedName().Catalog().empty() || !func.GetQualifiedName().Schema().empty()) {
+		return false;
+	}
+	auto name = StringUtil::Lower(func.FunctionName().GetIdentifierName());
+	return name == "sum" || name == "count" || name == "count_star" || name == "min" || name == "max" ||
+	       name == "avg" || name == "mean" || name == "median" || name == "stddev" || name == "stddev_samp" ||
+	       name == "stddev_pop" || name == "var_samp" || name == "var_pop" || name == "variance" ||
+	       name == "string_agg" || name == "list" || name == "array_agg" || name == "bool_and" ||
+	       name == "bool_or" || name == "product" || name == "first" || name == "last" ||
+	       name == "arg_min" || name == "arg_max" || name == "approx_count_distinct" || name == "quantile" ||
+	       name == "quantile_cont" || name == "quantile_disc" || name == "histogram" || name == "mode" ||
+	       name == "entropy" || name == "kurtosis" || name == "skewness" || name == "corr" ||
+	       name == "covar_pop" || name == "covar_samp" || name == "bit_and" || name == "bit_or" ||
+	       name == "bit_xor" || name == "count_if" || name == "sum_no_overflow" || name == "fsum" ||
+	       name == "favg" || name == "regr_slope" || name == "regr_intercept" || name == "regr_count";
+}
+
+bool RemotePushdownOptimizer::DecomposeAggregate(const FunctionExpression &agg, string &merge_function,
+                                                bool &zero_default) {
+	zero_default = false;
+	// DISTINCT breaks additivity: summing per-group distinct counts double-counts any value
+	// that appears under more than one group key. FILTER / ORDER BY / export_state change the
+	// aggregate's meaning in ways the two-phase form does not reproduce.
+	if (agg.Distinct() || agg.Filter() || agg.ExportState()) {
+		return false;
+	}
+	// FunctionExpression always allocates an OrderModifier, so an aggregate with no ORDER BY
+	// still has a non-null one - only actual ordering entries disqualify
+	if (agg.OrderBy() && !agg.OrderBy()->orders.empty()) {
+		return false;
+	}
+	auto name = StringUtil::Lower(agg.FunctionName().GetIdentifierName());
+	if (name == "sum" || name == "count" || name == "count_star" || name == "sum_no_overflow") {
+		// Partial sums and counts are combined by summing
+		merge_function = "sum";
+		// COUNT and SUM differ on empty input, and the difference survives the rewrite. When a
+		// pushed filter eliminates every row the fragment returns no rows at all, so the master's
+		// SUM sees an empty input and yields NULL. That is right for SUM but wrong for COUNT,
+		// which must be 0 - an ungrouped aggregate emits one row for the implicit group whether
+		// or not any input row survived. So the count family carries a zero default and SUM
+		// deliberately does not.
+		zero_default = (name == "count" || name == "count_star");
+		return true;
+	}
+	if (name == "min" || name == "max") {
+		// Idempotent, so join duplication of the partial does not change the result
+		merge_function = name;
+		return true;
+	}
+	// Everything else either needs several partials (avg = sum/count) or has no additive
+	// merge at all (median, stddev, string_agg, ...)
+	return false;
+}
+
+//! Walk expr collecting the aggregates to push. Descends through ordinary functions so
+//! ROUND(SUM(x), 2) finds the SUM, but never into an aggregate's own arguments - those are
+//! consumed inside the fragment. Returns false when an aggregate is found that must not be
+//! pushed, which disqualifies the whole side.
+bool RemotePushdownOptimizer::CollectPushableAggregates(const ParsedExpression &expr,
+                                                       const identifier_set_t &pushed_aliases, idx_t &counter,
+                                                       vector<PartialAggregate> &out) {
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &func = expr.Cast<FunctionExpression>();
+		if (IsKnownAggregateName(func)) {
+			// Which side supplies this aggregate's inputs?
+			bool references_other = false;
+			ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+			    func, [&](const ColumnRefExpression &col_ref) {
+				    auto &names = col_ref.ColumnNames();
+				    if (names.size() < 2 || pushed_aliases.find(names[names.size() - 2]) == pushed_aliases.end()) {
+					    references_other = true;
+				    }
+			    });
+			// An aggregate reading the other side would be computed over the collapsed row
+			// count: SUM(b.x) counts each b row once instead of once per pushed-side row.
+			// COUNT(*) has no column reference and legitimately counts pushed-side rows.
+			if (references_other) {
+				return false;
+			}
+			string merge_function;
+			bool zero_default = false;
+			if (!DecomposeAggregate(func, merge_function, zero_default)) {
+				return false;
+			}
+			PartialAggregate agg;
+			agg.original = &expr;
+			agg.merge_function = std::move(merge_function);
+			agg.zero_default = zero_default;
+			agg.partial = func.Copy();
+			// The same aggregate is often written twice - once in the select list and again in
+			// HAVING or ORDER BY. Both occurrences need their own entry, because the replacement
+			// pass finds them by identity, but they can share one fragment column instead of
+			// computing and shipping the partial twice.
+			//
+			// Equality is ParsedExpression::Equals rather than a ToString() comparison: it walks
+			// the tree and compares the qualified name, the arguments, DISTINCT, FILTER and ORDER
+			// BY, while ignoring the alias. So "sum(o.amt) AS s" in the select list matches the
+			// bare "sum(o.amt)" in HAVING, which a text comparison would not, and it cannot be
+			// fooled by two different trees that happen to render alike.
+			for (auto &existing : out) {
+				if (existing.partial->Equals(*agg.partial)) {
+					agg.partial_name = existing.partial_name;
+					agg.projected = false;
+					break;
+				}
+			}
+			if (agg.projected) {
+				agg.partial_name = Identifier("__fedagg_" + std::to_string(counter++));
+			}
+			out.push_back(std::move(agg));
+			return true;
+		}
+	}
+	// A subquery could reference either side in ways this rewrite does not model
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return false;
+	}
+	bool ok = true;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (!CollectPushableAggregates(child, pushed_aliases, counter, out)) {
+			ok = false;
+		}
+	});
+	return ok;
+}
+
+bool RemotePushdownOptimizer::AllJoinsAreInner(const TableRef &ref) {
+	if (ref.type != TableReferenceType::JOIN) {
+		return true;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	if (join.type != JoinType::INNER || join.ref_type != JoinRefType::REGULAR) {
+		return false;
+	}
+	if (join.left && !AllJoinsAreInner(*join.left)) {
+		return false;
+	}
+	if (join.right && !AllJoinsAreInner(*join.right)) {
+		return false;
+	}
+	return true;
+}
+
+bool RemotePushdownOptimizer::NodeHasWindow(const SelectNode &node) {
+	for (auto &expr : node.select_list) {
+		if (expr->IsWindow()) {
+			return true;
+		}
+	}
+	if (node.having && node.having->IsWindow()) {
+		return true;
+	}
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type != ResultModifierType::ORDER_MODIFIER) {
+			continue;
+		}
+		for (auto &order : modifier->Cast<OrderModifier>().orders) {
+			if (order.expression->IsWindow()) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool RemotePushdownOptimizer::AddGroupColumn(vector<GroupColumn> &out, const Identifier &alias,
+                                             const Identifier &column) {
+	// Record once, preserving first-seen order so the fragment's projection is deterministic
+	for (auto &existing : out) {
+		if (existing.alias == alias && existing.column == column) {
+			return true;
+		}
+	}
+	auto projected = Identifier(alias.GetIdentifierName() + "__" + column.GetIdentifierName());
+	// alias__column is not injective: alias `o` column `x__y` and alias `o__x` column `y` both
+	// produce o__x__y. Projecting the name twice makes the second silently shadow the first, so
+	// the master reads one column's values under the other's name. Decline the side instead -
+	// the caller falls back to pushing each table separately, which is correct and only loses
+	// the grouping optimization for this query.
+	for (auto &existing : out) {
+		if (existing.projected_name == projected) {
+			return false;
+		}
+	}
+	GroupColumn col;
+	col.alias = alias;
+	col.column = column;
+	col.projected_name = std::move(projected);
+	out.push_back(std::move(col));
+	return true;
+}
+
+bool RemotePushdownOptimizer::CollectPushedColumns(const ParsedExpression &expr,
+                                                  const identifier_set_t &pushed_aliases,
+                                                  const vector<PartialAggregate> &aggregates,
+                                                  vector<GroupColumn> &out) {
+	// An aggregate being pushed consumes its own columns inside the fragment - they do not
+	// have to survive as group keys
+	for (auto &agg : aggregates) {
+		if (agg.original == &expr) {
+			return true;
+		}
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &col_ref = expr.Cast<ColumnRefExpression>();
+		auto &names = col_ref.ColumnNames();
+		if (names.size() < 2) {
+			// Unqualified: cannot be attributed to a side before binding. Only a problem if
+			// it might belong to the pushed side, which we cannot rule out.
+			return false;
+		}
+		auto &qualifier = names[names.size() - 2];
+		if (pushed_aliases.find(qualifier) != pushed_aliases.end()) {
+			// A projected-name collision disqualifies the side; see AddGroupColumn
+			if (!AddGroupColumn(out, qualifier, names.back())) {
+				return false;
+			}
+		}
+		return true;
+	}
+	// A subquery may reference the pushed side in ways this rewrite does not track
+	if (expr.HasSubquery()) {
+		return false;
+	}
+	bool ok = true;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (!CollectPushedColumns(child, pushed_aliases, aggregates, out)) {
+			ok = false;
+		}
+	});
+	return ok;
+}
+
+bool RemotePushdownOptimizer::CollectPushedColumnsInTableRef(const TableRef &ref,
+                                                            const identifier_set_t &pushed_aliases,
+                                                            const vector<PartialAggregate> &aggregates,
+                                                            vector<GroupColumn> &out) {
+	if (ref.type != TableReferenceType::JOIN) {
+		return true;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	if (join.condition && !CollectPushedColumns(*join.condition, pushed_aliases, aggregates, out)) {
+		return false;
+	}
+	// USING columns are unqualified by construction, so they could resolve to either side.
+	// Treat any USING as disqualifying rather than guessing.
+	if (!join.using_columns.empty()) {
+		return false;
+	}
+	if (join.left && !CollectPushedColumnsInTableRef(*join.left, pushed_aliases, aggregates, out)) {
+		return false;
+	}
+	if (join.right && !CollectPushedColumnsInTableRef(*join.right, pushed_aliases, aggregates, out)) {
+		return false;
+	}
+	return true;
+}
+
+void RemotePushdownOptimizer::CollectSelectListAliases(const SelectNode &node,
+                                                       identifier_map_t<const ParsedExpression *> &out) {
+	// The same loop BindSelectNode runs to fill SelectBindState::alias_map: only an explicit
+	// alias counts, and a repeated alias overwrites the earlier entry, because the last one is
+	// what ORDER BY binds to.
+	for (auto &expr : node.select_list) {
+		if (expr->GetAlias().empty()) {
+			continue;
+		}
+		out[expr->GetAlias()] = expr.get();
+	}
+}
+
+const ParsedExpression &
+RemotePushdownOptimizer::ResolveOrderByAlias(const ParsedExpression &expr,
+                                             const identifier_map_t<const ParsedExpression *> &select_aliases) {
+	if (expr.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return expr;
+	}
+	auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+	// Only the ORDER BY entry itself, and only a bare one-part name. OrderBinder::Bind consults
+	// the select list before qualifying anything, so there an alias beats a table column of the
+	// same name - but only for an entry that IS the column reference. A reference nested inside
+	// a larger expression takes the general path, which qualifies first, so the table column
+	// wins instead. Resolving one with the other's rule would silently reorder the result.
+	if (names.size() != 1) {
+		return expr;
+	}
+	auto entry = select_aliases.find(names[0]);
+	if (entry == select_aliases.end()) {
+		// A genuinely unqualified column, which still cannot be attributed to a side here
+		return expr;
+	}
+	// One step, as the binder does: the aliased expression is attributed by the ordinary rules
+	// and its own names are not resolved as aliases again. So `SELECT a + 1 AS a ORDER BY a`
+	// lands on `a + 1` and the `a` inside it is treated as a column, and resolution cannot cycle.
+	return *entry->second;
+}
+
+bool RemotePushdownOptimizer::PlanPartialAggregate(const SelectNode &node, const identifier_set_t &pushed_aliases,
+                                                  PartialAggregatePlan &plan) {
+	// GROUPING SETS / ROLLUP / CUBE produce several groupings at once; the two-phase rewrite
+	// below assumes a single one
+	if (node.groups.grouping_sets.size() > 1) {
+		return false;
+	}
+	// QUALIFY and window functions both need per-row detail that aggregation destroys
+	if (node.qualify || NodeHasWindow(node)) {
+		return false;
+	}
+	// Pre-aggregation changes the multiplicity a NULL-extending join observes
+	if (!node.from_table || !AllJoinsAreInner(*node.from_table)) {
+		return false;
+	}
+
+	// Collect every aggregate. All must be over the pushed side and decomposable: one
+	// aggregate over the other side would be computed over the collapsed row count and
+	// silently wrong, so a single unsuitable aggregate disqualifies the whole side.
+	idx_t partial_counter = 0;
+	for (auto &expr : node.select_list) {
+		if (!CollectPushableAggregates(*expr, pushed_aliases, partial_counter, plan.aggregates)) {
+			return false;
+		}
+	}
+	// HAVING and ORDER BY may hold aggregates too; they get the same merge treatment, so they
+	// must be collected here rather than left behind referencing columns the fragment removed
+	if (node.having && !CollectPushableAggregates(*node.having, pushed_aliases, partial_counter, plan.aggregates)) {
+		return false;
+	}
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type != ResultModifierType::ORDER_MODIFIER) {
+			continue;
+		}
+		for (auto &order : modifier->Cast<OrderModifier>().orders) {
+			if (!CollectPushableAggregates(*order.expression, pushed_aliases, partial_counter, plan.aggregates)) {
+				return false;
+			}
+		}
+	}
+	if (plan.aggregates.empty()) {
+		// Nothing to pre-aggregate; a plain scan pushdown is the right treatment
+		return false;
+	}
+
+	// Every other pushed-side reference must survive aggregation as a group key
+	for (auto &expr : node.select_list) {
+		if (!CollectPushedColumns(*expr, pushed_aliases, plan.aggregates, plan.group_columns)) {
+			return false;
+		}
+	}
+	for (auto &expr : node.groups.group_expressions) {
+		if (!CollectPushedColumns(*expr, pushed_aliases, plan.aggregates, plan.group_columns)) {
+			return false;
+		}
+	}
+	if (node.having && !CollectPushedColumns(*node.having, pushed_aliases, plan.aggregates, plan.group_columns)) {
+		return false;
+	}
+	// An ORDER BY entry naming one of this select list's own aliases is not a column at all, so
+	// it is resolved before attribution. The columns that decide the side are the aliased
+	// expression's, and every select-list expression has already been walked above.
+	identifier_map_t<const ParsedExpression *> select_aliases;
+	CollectSelectListAliases(node, select_aliases);
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type == ResultModifierType::ORDER_MODIFIER) {
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				auto &target = ResolveOrderByAlias(*order.expression, select_aliases);
+				if (!CollectPushedColumns(target, pushed_aliases, plan.aggregates, plan.group_columns)) {
+					return false;
+				}
+			}
+		} else if (modifier->type == ResultModifierType::DISTINCT_MODIFIER) {
+			for (auto &expr : modifier->Cast<DistinctModifier>().distinct_on_targets) {
+				if (!CollectPushedColumns(*expr, pushed_aliases, plan.aggregates, plan.group_columns)) {
+					return false;
+				}
+			}
+		}
+	}
+	// Join keys must survive so the master can still join the fragment
+	if (!CollectPushedColumnsInTableRef(*node.from_table, pushed_aliases, plan.aggregates, plan.group_columns)) {
+		return false;
+	}
+	// The WHERE clause is the one place references may vanish: conjuncts confined to the
+	// pushed side travel into the fragment and are dropped from the master. Anything else
+	// touching the pushed side would have to be evaluated after aggregation.
+	if (node.where_clause) {
+		vector<reference<ParsedExpression>> conjuncts;
+		CollectConjuncts(const_cast<ParsedExpression &>(*node.where_clause), conjuncts);
+		for (auto &conjunct : conjuncts) {
+			if (CanPushConjunctTo(conjunct.get(), pushed_aliases)) {
+				continue; // travels with the fragment
+			}
+			// Stays at the master, so any pushed-side column it needs must be a group key
+			if (!CollectPushedColumns(conjunct.get(), pushed_aliases, plan.aggregates, plan.group_columns)) {
+				return false;
+			}
+		}
+	}
+	// Grouping by nothing would collapse the side to one row and lose the join key
+	return !plan.group_columns.empty();
+}
+
+void RemotePushdownOptimizer::ApplyPartialAggregatesInExpression(unique_ptr<ParsedExpression> &expr,
+                                                                const PartialAggregatePlan &plan,
+                                                                const Identifier &fragment_alias) {
+	if (!expr) {
+		return;
+	}
+	for (auto &agg : plan.aggregates) {
+		if (agg.original != expr.get()) {
+			continue;
+		}
+		// SUM(oi.x) becomes sum(__fed_aN.__fedagg_0)
+		vector<Identifier> qualified {fragment_alias, agg.partial_name};
+		vector<unique_ptr<ParsedExpression>> children;
+		children.push_back(make_uniq<ColumnRefExpression>(std::move(qualified)));
+		unique_ptr<ParsedExpression> merged =
+		    make_uniq<FunctionExpression>(Identifier(agg.merge_function), std::move(children));
+		if (agg.zero_default) {
+			// COUNT(*) becomes COALESCE(sum(__fed_aN.__fedagg_0), 0). Without this an ungrouped
+			// count whose fragment returned no rows yields NULL, because the merge is SUM. The
+			// coalesce is a no-op whenever any partial row exists, so it only affects the empty
+			// case it exists for.
+			//
+			// COALESCE is an operator in DuckDB, not a catalog scalar function - building it as a
+			// FunctionExpression fails to bind with "Scalar Function with name coalesce does not exist".
+			auto coalesce = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
+			coalesce->GetChildrenMutable().push_back(std::move(merged));
+			coalesce->GetChildrenMutable().push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
+			merged = std::move(coalesce);
+		}
+		// Keep the original output name so the result column is unchanged
+		merged->SetAlias(expr->GetAlias());
+		expr = std::move(merged);
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { ApplyPartialAggregatesInExpression(child, plan, fragment_alias); });
+}
+
+void RemotePushdownOptimizer::ApplyPartialAggregates(SelectNode &node, const PartialAggregatePlan &plan,
+                                                    const Identifier &fragment_alias) {
+	for (auto &expr : node.select_list) {
+		ApplyPartialAggregatesInExpression(expr, plan, fragment_alias);
+	}
+	if (node.having) {
+		ApplyPartialAggregatesInExpression(node.having, plan, fragment_alias);
+	}
+	for (auto &modifier : node.modifiers) {
+		if (modifier->type != ResultModifierType::ORDER_MODIFIER) {
+			continue;
+		}
+		for (auto &order : modifier->Cast<OrderModifier>().orders) {
+			ApplyPartialAggregatesInExpression(order.expression, plan, fragment_alias);
+		}
+	}
+}
+
+void RemotePushdownOptimizer::PreserveSelectListNames(SelectNode &node) {
+	// Requalification rewrites "p"."category" to "__fed_aN"."p__category", and an unaliased
+	// select item takes its output name from the column it references - so without pinning the
+	// name first the result column would come back as p__category instead of category.
+	for (auto &expr : node.select_list) {
+		if (expr->GetExpressionClass() != ExpressionClass::COLUMN_REF || !expr->GetAlias().empty()) {
+			continue;
+		}
+		auto &names = expr->Cast<ColumnRefExpression>().ColumnNames();
+		if (!names.empty()) {
+			expr->SetAlias(names.back());
+		}
+	}
+}
+
+void RemotePushdownOptimizer::RemovePushedConjuncts(SelectNode &node, const identifier_set_t &pushed_aliases) {
+	if (!node.where_clause) {
+		return;
+	}
+	vector<reference<ParsedExpression>> conjuncts;
+	CollectConjuncts(*node.where_clause, conjuncts);
+	// Rebuild the WHERE from the conjuncts that did NOT travel with the fragment
+	unique_ptr<ParsedExpression> kept;
+	for (auto &conjunct : conjuncts) {
+		if (CanPushConjunctTo(conjunct.get(), pushed_aliases)) {
+			continue;
+		}
+		auto copy = conjunct.get().Copy();
+		if (!kept) {
+			kept = std::move(copy);
+		} else {
+			kept = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(kept), std::move(copy));
+		}
+	}
+	node.where_clause = std::move(kept);
+}
+
+bool RemotePushdownOptimizer::PushRemoteSubtreeAggregated(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
+                                                          SelectNode &node) {
+	if (!ref) {
+		return false;
+	}
+	// The side must be something the source can group: a base table, or an inner-join subtree
+	if (ref->type == TableReferenceType::JOIN && !AllJoinsAreInner(*ref)) {
+		return false;
+	}
+
+	identifier_set_t pushed_aliases;
+	CollectTableAliases(*ref, pushed_aliases);
+	if (pushed_aliases.empty()) {
+		return false;
+	}
+
+	PartialAggregatePlan plan;
+	if (!PlanPartialAggregate(node, pushed_aliases, plan)) {
+		return false;
+	}
+
+	// SELECT <group cols AS alias__col>, <partial aggs AS __fedagg_N>
+	// FROM <side> WHERE <pushable conjuncts> GROUP BY <group cols>
+	vector<unique_ptr<ParsedExpression>> projection;
+	vector<unique_ptr<ParsedExpression>> group_expressions;
+	for (auto &col : plan.group_columns) {
+		vector<Identifier> qualified {col.alias, col.column};
+		auto projected = make_uniq<ColumnRefExpression>(qualified);
+		projected->SetAlias(col.projected_name);
+		projection.push_back(std::move(projected));
+		group_expressions.push_back(make_uniq<ColumnRefExpression>(std::move(qualified)));
+	}
+	for (auto &agg : plan.aggregates) {
+		if (!agg.projected) {
+			// A repeat of an aggregate already in the projection; both merge the same column
+			continue;
+		}
+		auto partial = agg.partial->Copy();
+		partial->SetAlias(agg.partial_name);
+		projection.push_back(std::move(partial));
+	}
+
+	auto filter = BuildPushableFilter(node.where_clause.get(), pushed_aliases);
+	auto fragment_alias = Identifier("__fed_a" + std::to_string(pushdown_state.grouped_fragment_counter++));
+
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list = std::move(projection);
+	select_node->from_table = std::move(ref);
+	select_node->where_clause = std::move(filter);
+	select_node->groups.group_expressions = std::move(group_expressions);
+	// SelectNode::ToString() renders GROUP BY from grouping_sets, not from group_expressions,
+	// and the fragment travels as SQL text - without this the clause is silently dropped and
+	// the source rejects the query for selecting a non-grouped column
+	GroupingSet grouping_set;
+	for (idx_t i = 0; i < select_node->groups.group_expressions.size(); i++) {
+		grouping_set.insert(ProjectionIndex(i));
+	}
+	select_node->groups.grouping_sets.push_back(std::move(grouping_set));
+	StripCatalogName(*select_node, result.catalog->GetName());
+
+	ref = CreateRemoteFunctionRef(result, std::move(select_node));
+	if (!ref) {
+		return false;
+	}
+	ref->alias = fragment_alias;
+
+	// The conjuncts that travelled reference columns aggregation has removed, so unlike a
+	// plain scan pushdown they cannot be left behind. Safe because the join is inner.
+	RemovePushedConjuncts(node, pushed_aliases);
+	// Pin output names before requalification renames the columns they derive from
+	PreserveSelectListNames(node);
+	// Aggregates become merges over the partial columns
+	ApplyPartialAggregates(node, plan, fragment_alias);
+	// Surviving pushed-side columns now live under the fragment's flattened names
+	RequalifyColumnRefs(node, pushed_aliases, fragment_alias);
+	return true;
+}
+
+void RemotePushdownOptimizer::StripCatalogPrefix(ParsedExpression &expr, const Identifier &catalog_name) {
+	// Unlike StripCatalogName, which normalises to exactly table.column because the whole
+	// statement is moving to the source, this removes only the leading catalog identifier. The
+	// rest of the path has to survive: `rpc.t.s.a.b.c` is a struct walk, and taking the last two
+	// names would leave `b.c` and lose the column.
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(
+	    expr, [&](ColumnRefExpression &col_ref) {
+		    auto &names = col_ref.ColumnNamesMutable();
+		    if (names.size() >= 3 && names[0] == catalog_name) {
+			    names.erase(names.begin());
+		    }
+	    });
+}
+
+void RemotePushdownOptimizer::StripCatalogFromJoinConditions(optional_ptr<TableRef> ref,
+                                                             const Identifier &catalog_name) {
+	if (!ref || ref->type != TableReferenceType::JOIN) {
+		return;
+	}
+	auto &join = ref->Cast<JoinRef>();
+	if (join.condition) {
+		StripCatalogPrefix(*join.condition, catalog_name);
+	}
+	StripCatalogFromJoinConditions(join.left.get(), catalog_name);
+	StripCatalogFromJoinConditions(join.right.get(), catalog_name);
+}
+
+void RemotePushdownOptimizer::StripCatalogFromNodeExpressions(SelectNode &node, const Identifier &catalog_name) {
+	// Only the expressions. The FROM tree's own table names are left alone, because a table of
+	// this catalog that was not pushed still has to resolve through its catalog.
+	for (auto &expr : node.select_list) {
+		if (expr) {
+			StripCatalogPrefix(*expr, catalog_name);
+		}
+	}
+	if (node.where_clause) {
+		StripCatalogPrefix(*node.where_clause, catalog_name);
+	}
+	for (auto &expr : node.groups.group_expressions) {
+		if (expr) {
+			StripCatalogPrefix(*expr, catalog_name);
+		}
+	}
+	if (node.having) {
+		StripCatalogPrefix(*node.having, catalog_name);
+	}
+	if (node.qualify) {
+		StripCatalogPrefix(*node.qualify, catalog_name);
+	}
+	for (auto &modifier : node.modifiers) {
+		if (!modifier || modifier->type != ResultModifierType::ORDER_MODIFIER) {
+			continue;
+		}
+		for (auto &order : modifier->Cast<OrderModifier>().orders) {
+			if (order.expression) {
+				StripCatalogPrefix(*order.expression, catalog_name);
+			}
+		}
+	}
+	StripCatalogFromJoinConditions(node.from_table.get(), catalog_name);
 }
 
 void RemotePushdownOptimizer::PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base) {
@@ -814,7 +1486,19 @@ void RemotePushdownOptimizer::PushCrossCatalogJoinSides(SelectNode &node, idx_t 
 		if (!pending.ref_slot || !*pending.ref_slot) {
 			continue;
 		}
+		// Pre-aggregating at the source turns a full-table scan into one row per group, so
+		// try it before falling back to shipping rows
+		if (PushRemoteSubtreeAggregated(*pending.ref_slot, pending.result, node)) {
+			continue;
+		}
 		PushRemoteSubtreeTables(*pending.ref_slot, pending.result, node);
+		// The side no longer resolves through its catalog: it is a fragment now, bound under the
+		// table's own alias. A conjunct BuildPushableFilter left behind, or an outer ON or select
+		// list entry, still says `catalog.table.column` and would fail to bind. Normalising those
+		// to `table.column` is what upstream does for whole-statement pushdown.
+		if (pending.result.catalog) {
+			StripCatalogFromNodeExpressions(node, pending.result.catalog->GetName());
+		}
 	}
 }
 

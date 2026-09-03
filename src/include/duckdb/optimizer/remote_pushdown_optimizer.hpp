@@ -246,6 +246,100 @@ private:
 	                                          const Identifier &fragment_alias);
 	//! Push every base table under a remote subtree individually, so each keeps its own alias.
 	void PushRemoteSubtreeTables(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
+
+	//! An aggregate over the pushed side that decomposes into a partial computed at the source
+	//! and a merge computed at the master.
+	struct PartialAggregate {
+		//! Identity of the aggregate expression in the enclosing node, used to find it again
+		//! when the replacement pass walks the tree
+		const ParsedExpression *original;
+		//! The aggregate the source computes, projected as partial_name
+		unique_ptr<ParsedExpression> partial;
+		//! sum / min / max - the function that combines partials at the master
+		string merge_function;
+		//! True for the COUNT family, where the merge needs a zero default. COUNT over no rows
+		//! is 0, but the merge is SUM, and SUM over no partial rows is NULL - so the master
+		//! wraps the merge in COALESCE(..., 0). Only the count family: SUM over an empty input
+		//! is legitimately NULL and must stay NULL.
+		bool zero_default = false;
+		//! Name the partial is projected under in the fragment (__fedagg_N)
+		Identifier partial_name;
+		//! False when an earlier entry already plans an identical partial - the same aggregate
+		//! written twice, typically once in the select list and once in HAVING. The fragment
+		//! projects the column once and every occurrence merges that one column, so only the
+		//! first entry of a group carries the projection.
+		bool projected = true;
+	};
+	//! A pushed-side column that must survive aggregation because something above references it
+	struct GroupColumn {
+		Identifier alias;
+		Identifier column;
+		//! alias__column, the name it is projected under in the fragment
+		Identifier projected_name;
+	};
+	//! Everything needed to rewrite one side into a pre-aggregated fragment. Only populated
+	//! when every precondition holds; see PlanPartialAggregate.
+	struct PartialAggregatePlan {
+		vector<PartialAggregate> aggregates;
+		vector<GroupColumn> group_columns;
+	};
+
+	//! Push a remote side as a PRE-AGGREGATED fragment: the source groups by the columns
+	//! referenced above and returns partial aggregates, so a query that scans millions of rows
+	//! to produce a handful ships only one row per group. Returns false when any precondition
+	//! fails, and the caller falls back to pushing the side as a plain scan.
+	bool PushRemoteSubtreeAggregated(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
+	//! Decide whether pre-aggregation is valid for this side and, if so, what to push.
+	//! Returns false at the first precondition that does not hold - a wrong answer here is
+	//! silent, so every uncertain case declines.
+	bool PlanPartialAggregate(const SelectNode &node, const identifier_set_t &pushed_aliases,
+	                          PartialAggregatePlan &plan);
+	//! Classify an aggregate: sets merge_function, and zero_default for the COUNT family,
+	//! when it decomposes. Returns false otherwise.
+	static bool DecomposeAggregate(const FunctionExpression &agg, string &merge_function, bool &zero_default);
+	//! Collect the aggregates to push, descending through ordinary functions but not into an
+	//! aggregate's arguments. Returns false when an aggregate must not be pushed.
+	static bool CollectPushableAggregates(const ParsedExpression &expr, const identifier_set_t &pushed_aliases,
+	                                      idx_t &counter, vector<PartialAggregate> &out);
+	//! True when every join in the FROM tree is a plain inner join. Pre-aggregation changes the
+	//! row multiplicity a NULL-extending join would see, so outer joins decline.
+	static bool AllJoinsAreInner(const TableRef &ref);
+	//! True if the node contains a window function, which needs per-row detail
+	static bool NodeHasWindow(const SelectNode &node);
+	//! Record a pushed-side column once, preserving first-seen order
+	//! Returns false when alias__column collides with an already-recorded pair, which
+	//! disqualifies the side rather than silently projecting the same name twice.
+	static bool AddGroupColumn(vector<GroupColumn> &out, const Identifier &alias, const Identifier &column);
+	//! Collect (alias, column) for every pushed-side column reference in expr, skipping the
+	//! aggregate subtrees listed in plan. Returns false on a reference that cannot be
+	//! represented as a plain qualified column.
+	static bool CollectPushedColumns(const ParsedExpression &expr, const identifier_set_t &pushed_aliases,
+	                                 const vector<PartialAggregate> &aggregates, vector<GroupColumn> &out);
+	//! Same, over every join condition and USING clause in a FROM tree
+	static bool CollectPushedColumnsInTableRef(const TableRef &ref, const identifier_set_t &pushed_aliases,
+	                                           const vector<PartialAggregate> &aggregates, vector<GroupColumn> &out);
+	//! Map each select-list alias to the expression it names, the way BindSelectNode builds
+	//! SelectBindState::alias_map - a repeated alias resolves to the last entry that carries it
+	static void CollectSelectListAliases(const SelectNode &node, identifier_map_t<const ParsedExpression *> &out);
+	//! Resolve an ORDER BY entry that is a bare select-list alias to the expression it names,
+	//! or return the entry unchanged when it is not one. Attribution then proceeds on the
+	//! aliased expression's own columns
+	static const ParsedExpression &
+	ResolveOrderByAlias(const ParsedExpression &expr, const identifier_map_t<const ParsedExpression *> &select_aliases);
+	//! Replace each planned aggregate with its merge over the fragment's partial column
+	static void ApplyPartialAggregates(SelectNode &node, const PartialAggregatePlan &plan,
+	                                   const Identifier &fragment_alias);
+	static void ApplyPartialAggregatesInExpression(unique_ptr<ParsedExpression> &expr,
+	                                               const PartialAggregatePlan &plan,
+	                                               const Identifier &fragment_alias);
+	//! Pin the output name of every unaliased select item, so requalifying its column
+	//! reference to the fragment's prefixed name does not rename the result column.
+	static void PreserveSelectListNames(SelectNode &node);
+	//! Drop every conjunct that was pushed into the fragment. Unlike a plain scan pushdown the
+	//! predicate cannot stay at the master: aggregation has removed the columns it references.
+	//! Not static: shares CanPushConjunctTo with BuildPushableFilter so the set of conjuncts
+	//! removed here is exactly the set that travelled.
+	void RemovePushedConjuncts(SelectNode &node, const identifier_set_t &pushed_aliases);
 	//! Wrap a table ref that produces a remote statement's result into "SELECT * FROM <ref>"
 	static unique_ptr<SelectStatement> WrapRemoteRef(unique_ptr<TableRef> ref);
 
@@ -259,6 +353,12 @@ private:
 	//! Strip catalog prefix from expression column refs. When strip_subquery_bodies=false, leaves subquery
 	//! bodies untouched (used for partial pushdown where inner subqueries are not being pushed).
 	static void StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name);
+	//! Normalise catalog-qualified column references in a node's expressions to table.column,
+	//! after a join side of that catalog has been replaced by a fragment. The FROM tree's table
+	//! names are deliberately untouched.
+	static void StripCatalogFromNodeExpressions(SelectNode &node, const Identifier &catalog_name);
+	static void StripCatalogPrefix(ParsedExpression &expr, const Identifier &catalog_name);
+	static void StripCatalogFromJoinConditions(optional_ptr<TableRef> ref, const Identifier &catalog_name);
 	bool RefersToLocalTable(const ColumnRefExpression &col_ref) const;
 
 	bool RefersToCTE(const Identifier &cte_name, CatalogPushdownResult &result) const;
