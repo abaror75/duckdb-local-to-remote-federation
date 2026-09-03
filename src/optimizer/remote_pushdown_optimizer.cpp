@@ -614,6 +614,12 @@ void RemotePushdownOptimizer::PushRemoteSubtreeTables(unique_ptr<TableRef> &ref,
 		return;
 	}
 	if (ref->type == TableReferenceType::JOIN) {
+		// Prefer shipping the whole subtree so the join between its tables runs at the
+		// source. That is the difference between sending both tables in full and sending
+		// only the joined, filtered rows.
+		if (PushRemoteSubtreeGrouped(ref, result, node)) {
+			return;
+		}
 		auto &join = ref->Cast<JoinRef>();
 		PushRemoteSubtreeTables(join.left, result, node);
 		PushRemoteSubtreeTables(join.right, result, node);
@@ -623,6 +629,181 @@ void RemotePushdownOptimizer::PushRemoteSubtreeTables(unique_ptr<TableRef> &ref,
 	CollectTableAliases(*ref, aliases);
 	auto filter = BuildPushableFilter(node.where_clause.get(), aliases);
 	FinishPushdown(ref, result, std::move(filter));
+}
+
+bool RemotePushdownOptimizer::CollectGroupableBaseTables(
+    TableRef &ref, vector<std::pair<Identifier, reference<BaseTableRef>>> &tables) {
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base = ref.Cast<BaseTableRef>();
+		auto alias = base.alias.empty() ? base.Table() : base.alias;
+		tables.emplace_back(alias, base);
+		return true;
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		// Only a plain inner join is safe to collapse: an outer join's NULL-extension
+		// interacts with the filters that were pushed into the fragment.
+		if (join.type != JoinType::INNER || join.ref_type != JoinRefType::REGULAR) {
+			return false;
+		}
+		if (!join.left || !join.right) {
+			return false;
+		}
+		return CollectGroupableBaseTables(*join.left, tables) && CollectGroupableBaseTables(*join.right, tables);
+	}
+	default:
+		return false;
+	}
+}
+
+void RemotePushdownOptimizer::RequalifyColumnRefsInExpression(unique_ptr<ParsedExpression> &expr,
+                                                              const identifier_set_t &pushed_aliases,
+                                                              const Identifier &fragment_alias) {
+	if (!expr) {
+		return;
+	}
+	if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &col_ref = expr->Cast<ColumnRefExpression>();
+		auto &names = col_ref.ColumnNamesMutable();
+		if (names.size() >= 2) {
+			auto &qualifier = names[names.size() - 2];
+			if (pushed_aliases.find(qualifier) != pushed_aliases.end()) {
+				// "o"."order_id" becomes "__fed_jN"."o__order_id"
+				auto prefixed = Identifier(qualifier.GetIdentifierName() + "__" +
+				                           names.back().GetIdentifierName());
+				names.clear();
+				names.push_back(fragment_alias);
+				names.push_back(prefixed);
+			}
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) {
+		    RequalifyColumnRefsInExpression(child, pushed_aliases, fragment_alias);
+	    });
+}
+
+void RemotePushdownOptimizer::RequalifyColumnRefsInTableRef(TableRef &ref, const identifier_set_t &pushed_aliases,
+                                                            const Identifier &fragment_alias) {
+	// The conditions of the *enclosing* joins still reference the pushed aliases and are not
+	// reachable through the query node's expression list, so walk the join tree directly.
+	// Deliberately an explicit walk rather than EnumerateTableRefChildren: that helper already
+	// descends into nested refs itself, so recursing from its callback re-walks each subtree
+	// and never terminates.
+	//
+	// Subqueries are not entered - their FROM clause opens a new alias scope, so an "o" inside
+	// a subquery is a different table than the "o" that was just pushed.
+	if (ref.type != TableReferenceType::JOIN) {
+		return;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	RequalifyColumnRefsInExpression(join.condition, pushed_aliases, fragment_alias);
+	if (join.left) {
+		RequalifyColumnRefsInTableRef(*join.left, pushed_aliases, fragment_alias);
+	}
+	if (join.right) {
+		RequalifyColumnRefsInTableRef(*join.right, pushed_aliases, fragment_alias);
+	}
+}
+
+void RemotePushdownOptimizer::RequalifyColumnRefs(SelectNode &node, const identifier_set_t &pushed_aliases,
+                                                 const Identifier &fragment_alias) {
+	for (auto &expr : node.select_list) {
+		RequalifyColumnRefsInExpression(expr, pushed_aliases, fragment_alias);
+	}
+	RequalifyColumnRefsInExpression(node.where_clause, pushed_aliases, fragment_alias);
+	for (auto &expr : node.groups.group_expressions) {
+		RequalifyColumnRefsInExpression(expr, pushed_aliases, fragment_alias);
+	}
+	RequalifyColumnRefsInExpression(node.having, pushed_aliases, fragment_alias);
+	RequalifyColumnRefsInExpression(node.qualify, pushed_aliases, fragment_alias);
+	// ORDER BY / LIMIT / DISTINCT ON expressions - EnumerateQueryNodeModifiers already visits
+	// every modifier, so it is called once rather than per modifier.
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+	    node, [&](unique_ptr<ParsedExpression> &child) {
+		    RequalifyColumnRefsInExpression(child, pushed_aliases, fragment_alias);
+	    });
+	if (node.from_table) {
+		RequalifyColumnRefsInTableRef(*node.from_table, pushed_aliases, fragment_alias);
+	}
+}
+
+bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
+                                                      SelectNode &node) {
+	vector<std::pair<Identifier, reference<BaseTableRef>>> tables;
+	if (!CollectGroupableBaseTables(*ref, tables) || tables.size() < 2) {
+		return false;
+	}
+
+	// Every alias in the subtree must be distinct for the prefixed names to be unambiguous
+	identifier_set_t pushed_aliases;
+	for (auto &entry : tables) {
+		if (!pushed_aliases.insert(entry.first).second) {
+			return false;
+		}
+	}
+
+	// Project "alias.column AS alias__column" for every column of every table in the
+	// subtree. The flat remote result would otherwise collide on any column name the
+	// tables share (order_id appears in both orders and order_items).
+	vector<unique_ptr<ParsedExpression>> projection;
+	// alias__column is not injective: alias `o` column `x__y` and alias `o__x` column `y` both
+	// produce o__x__y. The flat result would carry the name twice and the master would bind the
+	// first for both, silently reading one column's values under the other's name. Track the
+	// names and decline the whole grouping on a collision - the caller then pushes each table
+	// separately, which is correct and merely loses the optimization here.
+	case_insensitive_set_t projected_names;
+	for (auto &entry : tables) {
+		auto &alias = entry.first;
+		auto &base = entry.second.get();
+
+		Identifier catalog_name;
+		vector<Identifier> schema_path;
+		ResolveQualification(base.GetQualifiedName(), catalog_name, schema_path);
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, base.Table());
+		auto entry_ptr = LookupEntry(catalog_name, lookup, schema_path);
+		if (!entry_ptr || entry_ptr->type != CatalogType::TABLE_ENTRY) {
+			return false;
+		}
+		auto &table_entry = entry_ptr->Cast<TableCatalogEntry>();
+		auto &columns = table_entry.GetColumns();
+		if (columns.LogicalColumnCount() == 0) {
+			return false;
+		}
+		for (auto &col : columns.Logical()) {
+			auto projected = alias.GetIdentifierName() + "__" + col.Name().GetIdentifierName();
+			if (!projected_names.insert(projected).second) {
+				return false;
+			}
+			vector<Identifier> qualified {alias, col.Name()};
+			auto col_ref = make_uniq<ColumnRefExpression>(std::move(qualified));
+			col_ref->SetAlias(Identifier(projected));
+			projection.push_back(std::move(col_ref));
+		}
+	}
+
+	auto filter = BuildPushableFilter(node.where_clause.get(), pushed_aliases);
+
+	// A distinct alias per fragment keeps several grouped pushdowns in one query apart
+	auto fragment_alias = Identifier("__fed_j" + std::to_string(pushdown_state.grouped_fragment_counter++));
+
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list = std::move(projection);
+	select_node->from_table = std::move(ref);
+	select_node->where_clause = std::move(filter);
+	StripCatalogName(*select_node, result.catalog->GetName());
+
+	ref = CreateRemoteFunctionRef(result, std::move(select_node));
+	if (!ref) {
+		return false;
+	}
+	ref->alias = fragment_alias;
+
+	// The enclosing query still says o.x / oi.y - point those at the flattened result
+	RequalifyColumnRefs(node, pushed_aliases, fragment_alias);
+	return true;
 }
 
 void RemotePushdownOptimizer::PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base) {
