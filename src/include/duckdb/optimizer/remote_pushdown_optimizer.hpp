@@ -19,6 +19,7 @@ namespace duckdb {
 class Binder;
 class Catalog;
 class CatalogEntry;
+class RemotePushdownOptimizer;
 class ExpressionListRef;
 class FunctionExpression;
 class JoinRef;
@@ -77,10 +78,54 @@ struct ExpressionPushdownResult {
 	ExpressionFoldability foldability = ExpressionFoldability::NOT_FOLDABLE;
 };
 
+//! What the two sides of a join resolved to, handed to RemotePushdownHandler::JoinAnalyzed
+struct JoinSideAnalysis {
+	CatalogPushdownResult left;
+	CatalogPushdownResult right;
+	//! The two sides merged, before the join condition has been analyzed
+	CatalogPushdownResult merged;
+	//! Whether a CTE name was referenced while analyzing the side. A subtree that names a CTE
+	//! cannot be pushed on its own - only the enclosing statement carries the WITH clause
+	bool left_references_cte = false;
+	bool right_references_cte = false;
+};
+
+//! Observes the remote pushdown optimizer's walk over the parse tree. The built-in walk decides
+//! what a whole statement or query node resolves to and pushes it when that is a single remote
+//! catalog; a handler can additionally act on the *parts* of a statement that does not, for
+//! example push each single-catalog side of a cross-catalog join to its own source.
+//! One handler is created per walk, through DBConfig::create_remote_pushdown_handler, and is
+//! shared by every optimizer in it - so a candidate recorded in a nested scope, by a child
+//! optimizer, is still visible to the scope that can act on it.
+class RemotePushdownHandler {
+public:
+	virtual ~RemotePushdownHandler() = default;
+
+	//! A SelectNode is about to be analyzed. Its FROM clause has not been walked yet
+	virtual void EnterSelectNode(RemotePushdownOptimizer &optimizer, SelectNode &node) {
+	}
+	//! A SelectNode has been fully analyzed. When result is not SINGLE_REMOTE_CATALOG the node
+	//! stays local. This is the first point at which the FROM clause and the WHERE clause are
+	//! both available - they are siblings in the parse tree, so a filter is not reachable while
+	//! looking at the table it applies to
+	virtual void ExitSelectNode(RemotePushdownOptimizer &optimizer, SelectNode &node,
+	                            const CatalogPushdownResult &result) {
+	}
+	//! Both sides of a join have been analyzed; the join condition has not been
+	virtual void JoinAnalyzed(RemotePushdownOptimizer &optimizer, JoinRef &ref, const JoinSideAnalysis &analysis) {
+	}
+};
+
 struct RemotePushdownState {
 	bool search_path_initialized = false;
 	vector<reference<Catalog>> remote_catalogs_in_search_path;
 	vector<CatalogSearchEntry> local_catalogs_in_search_path;
+	//! Incremented whenever a table reference resolves to a CTE, so a handler can tell whether a
+	//! subtree depends on a CTE name that only the enclosing statement defines
+	idx_t cte_reference_count = 0;
+	//! The handler observing this walk, shared by every optimizer in it. Empty when no extension
+	//! registered one
+	unique_ptr<RemotePushdownHandler> handler;
 };
 
 class RemotePushdownOptimizer {
@@ -89,6 +134,29 @@ public:
 	explicit RemotePushdownOptimizer(optional_ptr<RemotePushdownOptimizer> parent);
 
 	void Rewrite(unique_ptr<SQLStatement> &statement);
+
+public:
+	//! The binder the statement will be bound with, for handlers that need the client context
+	Binder &GetBinder() {
+		return binder;
+	}
+	//! Resolve a (possibly nested) qualified name into the catalog it lives in and its schema path. This runs the
+	//! same catalog/schema ambiguity resolution the binder does, and - unlike Catalog()/Schema() - keeps every
+	//! level of a nested schema path. The catalog is empty when the name is not catalog-qualified
+	void ResolveQualification(const QualifiedName &name, Identifier &catalog_name, vector<Identifier> &schema_path);
+	//! Look an entry up in a catalog, defaulting to the main schema when the name carries no schema
+	optional_ptr<CatalogEntry> LookupEntry(const Identifier &catalog_name, const EntryLookupInfo &lookup,
+	                                       const vector<Identifier> &schema_path);
+	//! Replace a query node with a scan of the remote catalog that executes it
+	unique_ptr<TableRef> CreateRemoteFunctionRef(CatalogPushdownResult &result, unique_ptr<QueryNode> node);
+	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name);
+	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name);
+	static void StripCatalogName(TableRef &ref, const Identifier &catalog_name);
+	static void StripCatalogName(CreateInfo &info, const Identifier &catalog_name);
+	static void StripCatalogName(AlterInfo &info, const Identifier &catalog_name);
+	//! Strip catalog prefix from expression column refs. When strip_subquery_bodies=false, leaves subquery
+	//! bodies untouched (used for partial pushdown where inner subqueries are not being pushed).
+	static void StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name);
 
 private:
 	void FindRemoteCatalogsInSearchPath();
@@ -121,13 +189,6 @@ private:
 	CatalogPushdownResult ResolveRemoteCatalog(const Identifier &catalog_name, RemoteCapability capability);
 	//! Give the resolved catalog the chance to veto pushing down this statement as a whole
 	CatalogPushdownResult VerifyStatementSupport(const SQLStatement &statement, CatalogPushdownResult target);
-	//! Resolve a (possibly nested) qualified name into the catalog it lives in and its schema path. This runs the
-	//! same catalog/schema ambiguity resolution the binder does, and - unlike Catalog()/Schema() - keeps every
-	//! level of a nested schema path. The catalog is empty when the name is not catalog-qualified
-	void ResolveQualification(const QualifiedName &name, Identifier &catalog_name, vector<Identifier> &schema_path);
-	//! Look an entry up in a catalog, defaulting to the main schema when the name carries no schema
-	optional_ptr<CatalogEntry> LookupEntry(const Identifier &catalog_name, const EntryLookupInfo &lookup,
-	                                       const vector<Identifier> &schema_path);
 	//! Whether any non-remote catalog in the search path holds this entry
 	bool EntryExistsInLocalCatalog(const EntryLookupInfo &lookup, const vector<Identifier> &schema_path);
 	CatalogPushdownResult Rewrite(unique_ptr<TableRef> &ref);
@@ -182,15 +243,6 @@ private:
 	static unique_ptr<SelectStatement> WrapRemoteRef(unique_ptr<TableRef> ref);
 
 	static CatalogPushdownResult Merge(CatalogPushdownResult a, CatalogPushdownResult b);
-	unique_ptr<TableRef> CreateRemoteFunctionRef(CatalogPushdownResult &result, unique_ptr<QueryNode> node);
-	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name);
-	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name);
-	static void StripCatalogName(TableRef &ref, const Identifier &catalog_name);
-	static void StripCatalogName(CreateInfo &info, const Identifier &catalog_name);
-	static void StripCatalogName(AlterInfo &info, const Identifier &catalog_name);
-	//! Strip catalog prefix from expression column refs. When strip_subquery_bodies=false, leaves subquery
-	//! bodies untouched (used for partial pushdown where inner subqueries are not being pushed).
-	static void StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name);
 	bool RefersToLocalTable(const ColumnRefExpression &col_ref) const;
 
 	bool RefersToCTE(const Identifier &cte_name, CatalogPushdownResult &result) const;

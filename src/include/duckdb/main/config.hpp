@@ -59,6 +59,7 @@ struct LinkedExtension {
 class ErrorManager;
 class CompressionFunction;
 class TableFunctionRef;
+class RemotePushdownHandler;
 class OperatorExtension;
 class StorageExtension;
 class ExtensionCallback;
@@ -179,6 +180,10 @@ public:
 
 	//! Replacement table scans are automatically attempted when a table name cannot be found in the schema
 	vector<ReplacementScan> replacement_scans;
+	//! Creates the handler that observes the remote pushdown optimizer's walk over the parse tree,
+	//! or empty when no extension registered one. A fresh handler is created per walk, so it can
+	//! hold the state of that walk
+	std::function<unique_ptr<RemotePushdownHandler>()> create_remote_pushdown_handler;
 
 	//! The FileSystem to use, can be overwritten to allow for injecting custom file systems for testing purposes (e.g.
 	//! RamFS or something similar)
