@@ -22,6 +22,7 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "debug_fs_extension.hpp"
+#include "fake_remote_extension.hpp"
 #include "sqlite/catch_test_reporter.hpp"
 #include "sqlite/sqllogic_test_logger.hpp"
 #include "sqlite/sqllogic_test_runner.hpp"
@@ -347,7 +348,12 @@ int main(int argc_in, char *argv[]) {
 	static CatchTestReporter catch_reporter;
 	TestReporter::Set(catch_reporter);
 	// debug_fs is linked into this binary; hand it to every database the runner creates
-	SetStaticExtensionLoader([](DuckDB &db) { db.LoadStaticExtension<DebugFsExtension>(); });
+	SetStaticExtensionLoader([](DuckDB &db) {
+		db.LoadStaticExtension<DebugFsExtension>();
+		// Registers the `fake_remote` catalog type, which is how the suite reaches the remote
+		// pushdown optimizer at all; see test/extension/fake_remote.
+		db.LoadStaticExtension<FakeRemoteExtension>();
+	});
 
 	auto &test_config = TestConfiguration::Get();
 	try {

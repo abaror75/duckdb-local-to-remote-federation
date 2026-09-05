@@ -20,6 +20,18 @@ add_library(test_debug_fs_extension OBJECT ${DEBUG_FS_EXTENSION_FILES})
 target_include_directories(test_debug_fs_extension
                            PRIVATE ${DEBUG_FS_INCLUDE_DIR})
 list(APPEND UNITTEST_OBJECT_FILES $<TARGET_OBJECTS:test_debug_fs_extension>)
+
+# fake_remote is linked into unittest only, never built as a loadable extension:
+# it exists so the sqllogictest suite can attach a catalog that reports
+# RemoteCapability::IS_REMOTE, which is the only switch that enables the
+# REMOTE_PUSHDOWN optimizer pass.
+set(FAKE_REMOTE_EXTENSION_FILES fake_remote/fake_remote_extension.cpp)
+set(FAKE_REMOTE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fake_remote/include")
+add_library(test_fake_remote_extension OBJECT ${FAKE_REMOTE_EXTENSION_FILES})
+target_include_directories(test_fake_remote_extension
+                           PRIVATE ${FAKE_REMOTE_INCLUDE_DIR})
+list(APPEND UNITTEST_OBJECT_FILES $<TARGET_OBJECTS:test_fake_remote_extension>)
+
 set(UNITTEST_OBJECT_FILES
     ${UNITTEST_OBJECT_FILES}
     PARENT_SCOPE)

@@ -2,6 +2,7 @@ include_directories(../third_party/catch)
 include_directories(../third_party/sqlite/include)
 include_directories(include)
 include_directories(extension/debug_fs/include)
+include_directories(extension/fake_remote/include)
 
 add_definitions(-DDUCKDB_MAJOR_VERSION=${DUCKDB_MAJOR_VERSION})
 add_definitions(-DDUCKDB_MINOR_VERSION=${DUCKDB_MINOR_VERSION})

@@ -1,0 +1,53 @@
+# name: test/sql/optimizer/remote_pushdown/catalog_stripping.test
+# description: RemotePushdownOptimizer strips only the leading catalog name from a column reference
+# group: [remote_pushdown]
+
+# The fake_remote catalog type is linked into unittest only (test/extension/fake_remote). It reports
+# RemoteCapability::IS_REMOTE, which is what enables the REMOTE_PUSHDOWN pass, and its RemoteExecute
+# returns the SQL the optimizer deparsed as a single VARCHAR row. So every query below asserts on
+# the fragment that would have been sent to a real source.
+
+statement ok
+ATTACH ':memory:' AS rpc (TYPE fake_remote);
+
+statement ok
+CREATE TABLE rpc.t(id INTEGER, val INTEGER);
+
+statement ok
+CREATE TABLE rpc.t_nested(id INTEGER, s STRUCT(a STRUCT(b STRUCT(c INTEGER))));
+
+# 3-part catalog.table.column loses one level
+query I
+SELECT id, rpc.t.val FROM rpc.t;
+----
+SELECT id, t.val FROM t
+
+# A walk into a nested struct keeps the whole path. Dropping all but the last two names
+# produced "b.c" here, losing both the column and the table.
+query I
+SELECT id, rpc.t_nested.s.a.b.c FROM rpc.t_nested ORDER BY id;
+----
+SELECT id, t_nested.s.a.b.c FROM t_nested ORDER BY id
+
+# The same reference in WHERE travels as SQL text through the same path
+query I
+SELECT id FROM rpc.t_nested WHERE rpc.t_nested.s.a.b.c > 10;
+----
+SELECT id FROM t_nested WHERE (t_nested.s.a.b.c > 10)
+
+# 4-part catalog.schema.table.column keeps the schema: it cannot be told apart from
+# catalog.table.struct.field, and the source resolves schema.table.column fine
+query I
+SELECT rpc.main.t.val FROM rpc.main.t;
+----
+SELECT main.t.val FROM main.t
+
+# A 2-part reference is table.column or struct-column.field, never catalog-qualified,
+# so it must survive untouched even when its first name matches the catalog
+statement ok
+CREATE TABLE rpc.t_struct(id INTEGER, rpc STRUCT(x INTEGER));
+
+query I
+SELECT id, rpc.x FROM rpc.t_struct;
+----
+SELECT id, rpc.x FROM t_struct
