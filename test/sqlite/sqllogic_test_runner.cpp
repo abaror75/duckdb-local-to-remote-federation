@@ -10,6 +10,7 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/settings.hpp"
 #include "debug_fs_extension.hpp"
+#include "fake_remote_extension.hpp"
 #include "sqllogic_parser.hpp"
 #include "test_helpers.hpp"
 #include "test_reporter.hpp"
@@ -254,6 +255,8 @@ NewDatabaseConnection SQLLogicTestRunner::CreateDatabase(const string &db_path, 
 	try {
 		result.db = make_uniq<DuckDB>(db_path, config.get());
 		result.db->LoadStaticExtension<DebugFsExtension>();
+		// Registers the `fake_remote` catalog type; see test/extension/fake_remote.
+		result.db->LoadStaticExtension<FakeRemoteExtension>();
 
 		// always load core functions
 		auto &test_config = TestConfiguration::Get();
