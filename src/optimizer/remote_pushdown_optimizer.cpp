@@ -539,9 +539,34 @@ bool RemotePushdownOptimizer::ContainsVolatileFunction(const ParsedExpression &e
 	return found;
 }
 
+//! True if `expr` or anything under it is a prepared-statement parameter.
+//!
+//! Recursion is explicit for the same reason ContainsVolatileFunction's is: a `$1` is always a child
+//! of something, and VisitExpression<T> stops descending at the first node of the requested class.
+static bool ContainsParameter(const ParsedExpression &expr) {
+	if (expr.GetExpressionClass() == ExpressionClass::PARAMETER) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (!found && ContainsParameter(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
 bool RemotePushdownOptimizer::CanPushConjunctTo(const ParsedExpression &expr, const identifier_set_t &aliases) {
 	// A subquery may correlate to the other side of the join or to a local table
 	if (expr.HasSubquery()) {
+		return false;
+	}
+	// A prepared-statement parameter is not a value yet. This rewrite runs on the parse tree, so
+	// `$1` reaches the source as the literal text `$1` and the source has nothing to bind it to:
+	// `Invalid Input Error: Values were not provided for the following prepared statement
+	// parameters: 1`, HTTP 500, on every EXECUTE. The conjunct stays at the master, which is where
+	// the value is; the fragment is then wider by whatever that predicate would have removed.
+	if (ContainsParameter(expr)) {
 		return false;
 	}
 	// WHERE cannot legally contain these, but a malformed tree must not be shipped
@@ -629,7 +654,7 @@ void RemotePushdownOptimizer::PushRemoteSubtreeTables(unique_ptr<TableRef> &ref,
 	identifier_set_t aliases;
 	CollectTableAliases(*ref, aliases);
 	auto filter = BuildPushableFilter(node.where_clause.get(), aliases);
-	FinishPushdown(ref, result, std::move(filter));
+	FinishPushdown(ref, result, node, aliases, std::move(filter));
 }
 
 bool RemotePushdownOptimizer::CollectGroupableBaseTables(
@@ -731,6 +756,372 @@ void RemotePushdownOptimizer::RequalifyColumnRefs(SelectNode &node, const identi
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Fragment projection pruning
+//
+// Which columns of a pushed side the enclosing node still references, decided on the PARSE TREE
+// before anything is bound. A fragment used to select every column of every table it named,
+// whatever the query read.
+//
+// The contract is a SUPERSET one and that is what makes it safe: RequalifyColumnRefs above
+// rewrites every pushed-alias reference it reaches without consulting the projection, so the
+// projection has to be a superset of what that walk rewrites. This collection therefore mirrors
+// it position for position, because every reference the rewrite acts on is either recorded here -
+// under exactly the name the projection emits - or reported unknown.
+//
+// Unknown is not localisable: one doubtful reference disables pruning for every side of the node,
+// and the fragment keeps the exhaustive projection it had. Projecting too much costs bytes we
+// already pay; projecting too little breaks binding.
+//===--------------------------------------------------------------------===//
+
+bool RemotePushdownOptimizer::PushedTable::HasColumn(const Identifier &column) const {
+	for (auto &existing : columns) {
+		if (existing == column) {
+			return true;
+		}
+	}
+	return false;
+}
+
+RemotePushdownOptimizer::FragmentColumns RemotePushdownOptimizer::FragmentColumns::Unknown() {
+	FragmentColumns result;
+	result.known = false;
+	return result;
+}
+
+void RemotePushdownOptimizer::FragmentColumns::MarkUnknown() {
+	known = false;
+	columns.clear();
+}
+
+void RemotePushdownOptimizer::FragmentColumns::Add(const Identifier &alias, const Identifier &column) {
+	columns[alias].insert(column);
+}
+
+bool RemotePushdownOptimizer::FragmentColumns::Contains(const Identifier &alias, const Identifier &column) const {
+	auto entry = columns.find(alias);
+	if (entry == columns.end()) {
+		return false;
+	}
+	return entry->second.find(column) != entry->second.end();
+}
+
+bool RemotePushdownOptimizer::ResolveTableColumnNames(const BaseTableRef &base, vector<Identifier> &out) {
+	Identifier catalog_name;
+	vector<Identifier> schema_path;
+	ResolveQualification(base.GetQualifiedName(), catalog_name, schema_path);
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, base.Table());
+	auto entry_ptr = LookupEntry(catalog_name, lookup, schema_path);
+	if (!entry_ptr || entry_ptr->type != CatalogType::TABLE_ENTRY) {
+		return false;
+	}
+	auto &columns = entry_ptr->Cast<TableCatalogEntry>().GetColumns();
+	if (columns.LogicalColumnCount() == 0) {
+		return false;
+	}
+	for (auto &col : columns.Logical()) {
+		out.push_back(col.Name());
+	}
+	return true;
+}
+
+bool RemotePushdownOptimizer::ResolvePushedTables(const vector<std::pair<Identifier, reference<BaseTableRef>>> &tables,
+                                                  vector<PushedTable> &out, bool &has_column_alias) {
+	has_column_alias = false;
+	for (auto &entry : tables) {
+		auto &base = entry.second.get();
+		PushedTable table;
+		table.alias = entry.first;
+		if (!ResolveTableColumnNames(base, table.columns)) {
+			return false;
+		}
+		if (!base.column_name_alias.empty()) {
+			has_column_alias = true;
+		}
+		out.push_back(std::move(table));
+	}
+	return true;
+}
+
+bool RemotePushdownOptimizer::ResolvePushedTable(const TableRef &ref, const Identifier &effective_alias,
+                                                 vector<PushedTable> &out) {
+	if (ref.type != TableReferenceType::BASE_TABLE) {
+		return false;
+	}
+	auto &base = ref.Cast<BaseTableRef>();
+	if (!base.column_name_alias.empty()) {
+		return false;
+	}
+	PushedTable table;
+	table.alias = effective_alias;
+	if (!ResolveTableColumnNames(base, table.columns)) {
+		return false;
+	}
+	out.push_back(std::move(table));
+	return true;
+}
+
+//! Record, ignore, or report unknown for one column reference. In order, for names of size n:
+//!   1  n < 2                                          unknown - unattributable before binding
+//!   2  a pushed alias in names[0 .. n-3]              unknown - a struct walk (o.s.a.b.c)
+//!   3  pushed-alias qualifier with no PushedTable     unknown - defensive
+//!   4  pushed-alias qualifier, column not declared    unknown - the binder reads a struct field
+//!   5  pushed-alias qualifier, column declared        record
+//!   6  sibling qualifier that is also a pushed column unknown - genuinely ambiguous
+//!   7  sibling qualifier                              ignore - another FROM item's column
+//!   8  otherwise                                      unknown - unrecognised qualifier
+void RemotePushdownOptimizer::AttributeColumnRef(const ColumnRefExpression &col_ref, const CollectContext &ctx,
+                                                 FragmentColumns &out) {
+	auto &names = col_ref.ColumnNames();
+	const auto name_count = names.size();
+	if (name_count < 2) {
+		out.MarkUnknown();
+		return;
+	}
+	// Position-independent on purpose: rpc.orders.status is live here, because catalog prefixes are
+	// only stripped after the side has been pushed
+	for (idx_t i = 0; i + 2 < name_count; i++) {
+		if (ctx.pushed_aliases.find(names[i]) != ctx.pushed_aliases.end()) {
+			out.MarkUnknown();
+			return;
+		}
+	}
+	auto &qualifier = names[name_count - 2];
+	auto &column = names[name_count - 1];
+	if (ctx.pushed_aliases.find(qualifier) != ctx.pushed_aliases.end()) {
+		for (auto &table : ctx.pushed) {
+			if (table.alias != qualifier) {
+				continue;
+			}
+			if (!table.HasColumn(column)) {
+				// The binder would read this as a struct field, and the name we would record is not
+				// a catalog column - so the exhaustive list has to travel and fail as it does today
+				out.MarkUnknown();
+				return;
+			}
+			out.Add(qualifier, column);
+			return;
+		}
+		out.MarkUnknown();
+		return;
+	}
+	if (ctx.scope_aliases.find(qualifier) != ctx.scope_aliases.end()) {
+		for (auto &table : ctx.pushed) {
+			if (table.HasColumn(qualifier)) {
+				// Relation-then-column, but if that relation lacks the column DuckDB reads it as a
+				// struct field of a pushed column instead
+				out.MarkUnknown();
+				return;
+			}
+		}
+		return;
+	}
+	out.MarkUnknown();
+}
+
+void RemotePushdownOptimizer::CollectFragmentColumnsInExpression(const ParsedExpression &expr,
+                                                                 const CollectContext &ctx, FragmentColumns &out) {
+	if (!out.known) {
+		return;
+	}
+	// The rewrite does not enter subqueries, and an inner scope may reuse a pushed alias. Both
+	// checks, not one: a correlated reference binds today, so pruning it away breaks a working query
+	if (expr.HasSubquery() || expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		out.MarkUnknown();
+		return;
+	}
+	// One check for *, alias.*, EXCLUDE, REPLACE, RENAME and COLUMNS(...): the expansion IS the
+	// fragment's column list, so pruning under one changes the master's result columns silently
+	// rather than failing to bind. count(*) is unaffected - the parser produces count_star().
+	if (expr.GetExpressionClass() == ExpressionClass::STAR) {
+		out.MarkUnknown();
+		return;
+	}
+	// #n binds positionally over the FROM clause, so a narrowed projection moves it to a different
+	// column. It is childless for EnumerateChildren, so without this arm the walk records nothing
+	// and prunes anyway.
+	if (expr.GetExpressionClass() == ExpressionClass::POSITIONAL_REFERENCE) {
+		out.MarkUnknown();
+		return;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		AttributeColumnRef(expr.Cast<ColumnRefExpression>(), ctx, out);
+		return;
+	}
+	// The same generated enumeration the rewrite descends with, so window PARTITION BY / frame
+	// bounds, aggregate FILTER / ORDER BY, operators and lambdas cannot drift apart from it
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { CollectFragmentColumnsInExpression(child, ctx, out); });
+}
+
+//! An allowlist over the enclosing FROM tree: anything not understood declines.
+void RemotePushdownOptimizer::CollectFragmentColumnsInTableRef(const TableRef &ref, const CollectContext &ctx,
+                                                               FragmentColumns &out) {
+	if (!out.known) {
+		return;
+	}
+	// Everything under the pushed subtree becomes the fragment's own FROM and is resolved at the
+	// source over the base tables, so it constrains nothing. Skipping it also makes this walk's
+	// view identical to RequalifyColumnRefs', which runs after the subtree has moved.
+	if (&ref == ctx.pushed_root) {
+		return;
+	}
+	// A sibling side this pushdown already replaced with a fragment. It is a TableFunctionRef, and
+	// the default arm below declines those, so it has to be recognised here.
+	for (auto *installed : ctx.installed_fragments) {
+		if (installed == &ref) {
+			return;
+		}
+	}
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE:
+		// Also how a CTE reference arrives before binding
+		return;
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		// NATURAL matches by column name over the fragment's names, so a narrowed projection
+		// changes which columns pair up. POSITIONAL / ASOF / DEPENDENT / NEAREST are declined
+		// unexamined. CROSS has to be allowed: `FROM a, b` is JoinRefType::CROSS.
+		if (join.ref_type != JoinRefType::REGULAR && join.ref_type != JoinRefType::CROSS) {
+			out.MarkUnknown();
+			return;
+		}
+		// A USING join is REGULAR, so this is a separate check
+		if (!join.using_columns.empty()) {
+			out.MarkUnknown();
+			return;
+		}
+		if (join.condition) {
+			CollectFragmentColumnsInExpression(*join.condition, ctx, out);
+		}
+		if (join.left) {
+			CollectFragmentColumnsInTableRef(*join.left, ctx, out);
+		}
+		if (join.right) {
+			CollectFragmentColumnsInTableRef(*join.right, ctx, out);
+		}
+		return;
+	}
+	case TableReferenceType::TABLE_FUNCTION: {
+		auto &tf = ref.Cast<TableFunctionRef>();
+		if (tf.subquery || !tf.function) {
+			out.MarkUnknown();
+			return;
+		}
+		// A table function argument reading a pushed column - FROM t, unnest(t.arr) - is a lateral
+		// reference this rewrite does not track, so recording anything here declines as well.
+		// Counting pairs rather than tracking them declines exactly when the argument names a
+		// column nothing else did: a column already recorded is already projected, which is all
+		// the superset contract needs.
+		idx_t recorded_before = 0;
+		for (auto &entry : out.columns) {
+			recorded_before += entry.second.size();
+		}
+		CollectFragmentColumnsInExpression(*tf.function, ctx, out);
+		if (!out.known) {
+			return;
+		}
+		idx_t recorded_after = 0;
+		for (auto &entry : out.columns) {
+			recorded_after += entry.second.size();
+		}
+		if (recorded_after != recorded_before) {
+			out.MarkUnknown();
+		}
+		return;
+	}
+	default:
+		// SUBQUERY, PIVOT, EXPRESSION_LIST, SHOW_REF, ... A FROM subquery is not negotiable: the
+		// parser discards the LATERAL marker, so one correlating to the pushed alias is
+		// indistinguishable from one that does not.
+		out.MarkUnknown();
+		return;
+	}
+}
+
+RemotePushdownOptimizer::FragmentColumns
+RemotePushdownOptimizer::CollectFragmentColumns(const SelectNode &node, const vector<PushedTable> &pushed,
+                                                const identifier_set_t &pushed_aliases,
+                                                const TableRef &pushed_root) const {
+	if (!node.from_table) {
+		return FragmentColumns::Unknown();
+	}
+	identifier_set_t scope_aliases;
+	CollectTableAliases(*node.from_table, scope_aliases);
+	CollectContext ctx {pushed, pushed_aliases, scope_aliases, &pushed_root, pushdown_state.installed_fragment_refs};
+
+	FragmentColumns out;
+	for (auto &expr : node.select_list) {
+		if (expr) {
+			CollectFragmentColumnsInExpression(*expr, ctx, out);
+		}
+	}
+	// The WHOLE clause, pushed conjuncts included. BuildPushableFilter pushes a copy and the
+	// original stays at the master, where the rewrite requalifies it - so a pushed conjunct's
+	// columns must be projected.
+	if (node.where_clause) {
+		CollectFragmentColumnsInExpression(*node.where_clause, ctx, out);
+	}
+	for (auto &expr : node.groups.group_expressions) {
+		if (expr) {
+			CollectFragmentColumnsInExpression(*expr, ctx, out);
+		}
+	}
+	if (node.having) {
+		CollectFragmentColumnsInExpression(*node.having, ctx, out);
+	}
+	if (node.qualify) {
+		CollectFragmentColumnsInExpression(*node.qualify, ctx, out);
+	}
+	// The modifiers explicitly rather than through EnumerateQueryNodeModifiers: only an ORDER BY
+	// arm can apply ResolveOrderByAlias, and a default arm closes the divergence for a modifier
+	// kind added later.
+	identifier_map_t<const ParsedExpression *> select_aliases;
+	CollectSelectListAliases(node, select_aliases);
+	for (auto &modifier : node.modifiers) {
+		if (!modifier) {
+			out.MarkUnknown();
+			break;
+		}
+		switch (modifier->type) {
+		case ResultModifierType::ORDER_MODIFIER:
+			for (auto &order : modifier->Cast<OrderModifier>().orders) {
+				if (order.expression) {
+					// ORDER BY <select alias> binds the select item, which was walked above;
+					// ORDER BY <alias>+0 takes the general path and stays a one-part name
+					CollectFragmentColumnsInExpression(ResolveOrderByAlias(*order.expression, select_aliases), ctx,
+					                                   out);
+				}
+			}
+			break;
+		case ResultModifierType::DISTINCT_MODIFIER:
+			for (auto &expr : modifier->Cast<DistinctModifier>().distinct_on_targets) {
+				if (expr) {
+					CollectFragmentColumnsInExpression(*expr, ctx, out);
+				}
+			}
+			break;
+		case ResultModifierType::LIMIT_MODIFIER: {
+			auto &limit = modifier->Cast<LimitModifier>();
+			if (limit.limit) {
+				CollectFragmentColumnsInExpression(*limit.limit, ctx, out);
+			}
+			if (limit.offset) {
+				CollectFragmentColumnsInExpression(*limit.offset, ctx, out);
+			}
+			break;
+		}
+		default:
+			out.MarkUnknown();
+			break;
+		}
+	}
+	CollectFragmentColumnsInTableRef(*node.from_table, ctx, out);
+	// node.cte_map is deliberately not walked: a CTE is a closed scope and cannot see this
+	// node's FROM clause.
+	return out;
+}
+
 bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
                                                       SelectNode &node) {
 	vector<std::pair<Identifier, reference<BaseTableRef>>> tables;
@@ -746,9 +1137,22 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 		}
 	}
 
-	// Project "alias.column AS alias__column" for every column of every table in the
-	// subtree. The flat remote result would otherwise collide on any column name the
-	// tables share (order_id appears in both orders and order_items).
+	// Project "alias.column AS alias__column" for the columns of the subtree's tables the
+	// enclosing node still references, or for all of them when the collection cannot decide.
+	// The flat remote result would otherwise collide on any column name the tables share
+	// (order_id appears in both orders and order_items).
+	vector<PushedTable> pushed;
+	bool has_column_alias = false;
+	if (!ResolvePushedTables(tables, pushed, has_column_alias)) {
+		return false;
+	}
+	// A positional column alias list on a base ref already breaks this path: the projection names
+	// catalog columns while the fragment's FROM renames them. Keep the exhaustive list rather than
+	// building pruning on it.
+	auto needed =
+	    has_column_alias ? FragmentColumns::Unknown() : CollectFragmentColumns(node, pushed, pushed_aliases, *ref);
+	const bool prune = needed.Prunable();
+
 	vector<unique_ptr<ParsedExpression>> projection;
 	// alias__column is not injective: alias `o` column `x__y` and alias `o__x` column `y` both
 	// produce o__x__y. The flat result would carry the name twice and the master would bind the
@@ -756,33 +1160,27 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 	// names and decline the whole grouping on a collision - the caller then pushes each table
 	// separately, which is correct and merely loses the optimization here.
 	case_insensitive_set_t projected_names;
-	for (auto &entry : tables) {
-		auto &alias = entry.first;
-		auto &base = entry.second.get();
-
-		Identifier catalog_name;
-		vector<Identifier> schema_path;
-		ResolveQualification(base.GetQualifiedName(), catalog_name, schema_path);
-		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, base.Table());
-		auto entry_ptr = LookupEntry(catalog_name, lookup, schema_path);
-		if (!entry_ptr || entry_ptr->type != CatalogType::TABLE_ENTRY) {
-			return false;
-		}
-		auto &table_entry = entry_ptr->Cast<TableCatalogEntry>();
-		auto &columns = table_entry.GetColumns();
-		if (columns.LogicalColumnCount() == 0) {
-			return false;
-		}
-		for (auto &col : columns.Logical()) {
-			auto projected = alias.GetIdentifierName() + "__" + col.Name().GetIdentifierName();
+	// Declared order, filtered - never reference order. That keeps the arrived order a subsequence
+	// of the declared one and keeps the collision check over exactly the names projected.
+	for (auto &table : pushed) {
+		for (auto &column : table.columns) {
+			if (prune && !needed.Contains(table.alias, column)) {
+				continue;
+			}
+			auto projected = table.alias.GetIdentifierName() + "__" + column.GetIdentifierName();
 			if (!projected_names.insert(projected).second) {
 				return false;
 			}
-			vector<Identifier> qualified {alias, col.Name()};
+			vector<Identifier> qualified {table.alias, column};
 			auto col_ref = make_uniq<ColumnRefExpression>(std::move(qualified));
 			col_ref->SetAlias(Identifier(projected));
 			projection.push_back(std::move(col_ref));
 		}
+	}
+	// A table contributing nothing is expected; a globally empty projection is not, and Prunable()
+	// has already turned that into a fallback. This guard is insurance.
+	if (projection.empty()) {
+		return false;
 	}
 
 	auto filter = BuildPushableFilter(node.where_clause.get(), pushed_aliases);
@@ -801,6 +1199,7 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 		return false;
 	}
 	ref->alias = fragment_alias;
+	pushdown_state.installed_fragment_refs.push_back(ref.get());
 
 	// The enclosing query still says o.x / oi.y - point those at the flattened result
 	PreserveSelectListNames(node);
@@ -3000,7 +3399,8 @@ void RemotePushdownOptimizer::FinishPushdown(unique_ptr<QueryNode> &node, Catalo
 }
 
 void RemotePushdownOptimizer::FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
-                                            unique_ptr<ParsedExpression> filter) {
+                                             const SelectNode &node, const identifier_set_t &pushed_aliases,
+                                             unique_ptr<ParsedExpression> filter) {
 	if (result.reference_type != CatalogReferenceType::SINGLE_REMOTE_CATALOG) {
 		return;
 	}
@@ -3013,11 +3413,40 @@ void RemotePushdownOptimizer::FinishPushdown(unique_ptr<TableRef> &ref, CatalogP
 	}
 	auto column_aliases = ref->column_name_alias;
 
-	// Wrap the table ref in SELECT * FROM <ref> [WHERE <filter>], strip the catalog prefix,
+	// Project only the columns the enclosing node still names, when the parse tree decides them.
+	// No requalification runs on this path - the master still says o.status - so the projection is
+	// plain alias.column, pinned to the catalog's spelling so the arrived names are deterministic.
+	//
+	// column_name_alias is positional and is applied twice - inside the fragment SQL (the ref moves
+	// into the FROM) and again by the binder over the arrived columns - so a narrowed projection
+	// either throws or renames silently. Declined; it is the only silent-wrong path this can reach.
+	vector<unique_ptr<ParsedExpression>> projection;
+	vector<PushedTable> pushed;
+	if (column_aliases.empty() && pushed_aliases.size() == 1 &&
+	    pushed_aliases.find(effective_alias) != pushed_aliases.end() &&
+	    ResolvePushedTable(*ref, effective_alias, pushed)) {
+		auto needed = CollectFragmentColumns(node, pushed, pushed_aliases, *ref);
+		if (needed.Prunable()) {
+			for (auto &column : pushed[0].columns) {
+				if (!needed.Contains(effective_alias, column)) {
+					continue;
+				}
+				auto col_ref = make_uniq<ColumnRefExpression>(vector<Identifier> {effective_alias, column});
+				col_ref->SetAlias(column);
+				projection.push_back(std::move(col_ref));
+			}
+		}
+	}
+
+	// Wrap the table ref in SELECT <columns> FROM <ref> [WHERE <filter>], strip the catalog prefix,
 	// then push to remote. Carrying the filter lets the source do the row reduction instead
 	// of returning the whole table for the master to filter.
 	auto select_node = make_uniq<SelectNode>();
-	select_node->select_list.push_back(make_uniq<StarExpression>());
+	if (projection.empty()) {
+		select_node->select_list.push_back(make_uniq<StarExpression>());
+	} else {
+		select_node->select_list = std::move(projection);
+	}
 	select_node->from_table = std::move(ref);
 	select_node->where_clause = std::move(filter);
 	StripCatalogName(*select_node, result.catalog->GetName());
@@ -3025,6 +3454,7 @@ void RemotePushdownOptimizer::FinishPushdown(unique_ptr<TableRef> &ref, CatalogP
 	if (ref) {
 		ref->alias = std::move(effective_alias);
 		ref->column_name_alias = std::move(column_aliases);
+		pushdown_state.installed_fragment_refs.push_back(ref.get());
 	}
 }
 

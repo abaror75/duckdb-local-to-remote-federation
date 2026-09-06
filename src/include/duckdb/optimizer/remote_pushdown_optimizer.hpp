@@ -98,6 +98,10 @@ struct RemotePushdownState {
 	vector<PendingRemoteJoinSide> pending_join_sides;
 	//! Names the alias of each grouped multi-table fragment (__fed_j0, __fed_j1, ...)
 	idx_t grouped_fragment_counter = 0;
+	//! Every fragment ref this pushdown has already installed in the tree. Read by the projection
+	//! collection, which has to tell such a leaf apart from a FROM item it does not understand: a
+	//! fragment is a TableFunctionRef, and an unrecognised table function declines pruning.
+	vector<const TableRef *> installed_fragment_refs;
 	//! Incremented whenever a table reference resolves to a CTE. A CTE body may live entirely in
 	//! one remote catalog, which classifies a reference to it as remotely pushable, but the CTE
 	//! *name* only exists in the enclosing statement. Whole-statement pushdown carries the WITH
@@ -202,10 +206,14 @@ private:
 	void FinishPushdown(unique_ptr<SQLStatement> &statement, CatalogPushdownResult result);
 	void FinishPushdown(unique_ptr<QueryNode> &node, CatalogPushdownResult result);
 	//! Push a single TableRef to its remote catalog (used for cross-catalog joins).
-	//! When filter is set it becomes the WHERE clause of the pushed "SELECT * FROM <ref>",
+	//! When filter is set it becomes the WHERE clause of the pushed "SELECT ... FROM <ref>",
 	//! so the remote side does the row reduction instead of shipping the whole table.
-	void FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result,
-	                    unique_ptr<ParsedExpression> filter = nullptr);
+	//!
+	//! `node` and `pushed_aliases` are what let the select list be narrowed to the columns the
+	//! enclosing node still names, instead of `SELECT *`. Both are needed rather than just the
+	//! node: the collection has to know which aliases resolve to the side being pushed.
+	void FinishPushdown(unique_ptr<TableRef> &ref, CatalogPushdownResult result, const SelectNode &node,
+	                    const identifier_set_t &pushed_aliases, unique_ptr<ParsedExpression> filter = nullptr);
 
 	//! Collect the table aliases (or table names when unaliased) visible under a TableRef subtree.
 	static void CollectTableAliases(const TableRef &ref, identifier_set_t &aliases);
@@ -246,6 +254,83 @@ private:
 	                                          const Identifier &fragment_alias);
 	//! Push every base table under a remote subtree individually, so each keeps its own alias.
 	void PushRemoteSubtreeTables(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
+
+	//===------------------------------------------------------------------===//
+	// Fragment projection pruning
+	//
+	// A fragment used to select every column of every table it named, whatever the query read.
+	// This narrows the select list to the columns the ENCLOSING node still references, read off
+	// the parse tree before anything is bound.
+	//
+	// The contract is a SUPERSET one, and it is what makes this safe: RequalifyColumnRefs rewrites
+	// every pushed-alias reference it reaches without consulting the projection, so the projection
+	// must cover everything that walk rewrites. The collection therefore mirrors that walk
+	// position for position, and every reference is either recorded under exactly the name the
+	// projection emits or reported unknown.
+	//
+	// Unknown is not localisable: one doubtful reference disables pruning for every side of the
+	// node and the fragment keeps the exhaustive projection. Projecting too much costs bytes we
+	// already pay; projecting too little breaks binding.
+	//===------------------------------------------------------------------===//
+
+	//! One table of a pushed side, with its catalog columns in declared order.
+	struct PushedTable {
+		Identifier alias;
+		vector<Identifier> columns;
+		bool HasColumn(const Identifier &column) const;
+	};
+
+	//! Which columns of a pushed side the enclosing node still needs. Tri-state: known == false
+	//! means the parse tree does not decide the set, and the fragment keeps projecting everything.
+	struct FragmentColumns {
+		bool known = true;
+		identifier_map_t<identifier_set_t> columns; //! alias -> column names
+		static FragmentColumns Unknown();
+		void MarkUnknown(); //! known = false, columns.clear()
+		void Add(const Identifier &alias, const Identifier &column);
+		bool Contains(const Identifier &alias, const Identifier &column) const;
+		//! Only a known, non-empty set may narrow a projection. An empty set is treated as
+		//! unknown: an empty select list is a parser error at the source and a zero-column
+		//! arrival fails in the remote scan.
+		bool Prunable() const {
+			return known && !columns.empty();
+		}
+	};
+
+	//! The immutable inputs of one collection pass
+	struct CollectContext {
+		const vector<PushedTable> &pushed;
+		const identifier_set_t &pushed_aliases;
+		//! every relation name visible in the enclosing node's FROM clause, from
+		//! CollectTableAliases - this is what makes "the qualifier is a relation" decidable
+		//! before binding
+		const identifier_set_t &scope_aliases;
+		//! the subtree that travels to the source; not walked
+		const TableRef *pushed_root;
+		//! fragment refs already installed in the tree; leaves that contribute nothing
+		const vector<const TableRef *> &installed_fragments;
+	};
+
+	//! Every column of the pushed side the enclosing node still references, or unknown.
+	FragmentColumns CollectFragmentColumns(const SelectNode &node, const vector<PushedTable> &pushed,
+	                                       const identifier_set_t &pushed_aliases, const TableRef &pushed_root) const;
+	static void CollectFragmentColumnsInExpression(const ParsedExpression &expr, const CollectContext &ctx,
+	                                               FragmentColumns &out);
+	static void CollectFragmentColumnsInTableRef(const TableRef &ref, const CollectContext &ctx, FragmentColumns &out);
+	//! Record / ignore / unknown for one column reference; see the table in the .cpp
+	static void AttributeColumnRef(const ColumnRefExpression &col_ref, const CollectContext &ctx, FragmentColumns &out);
+	//! Resolve every base table of a grouped subtree to its catalog columns, in declared order.
+	//! False on the declines the exhaustive loop already made (unresolvable entry, non-table
+	//! entry, zero logical columns). has_column_alias is set when any base ref carries a
+	//! positional column alias list, which forces the projection to stay exhaustive.
+	bool ResolvePushedTables(const vector<std::pair<Identifier, reference<BaseTableRef>>> &tables,
+	                         vector<PushedTable> &out, bool &has_column_alias);
+	//! The same for the single-table path. False for anything but a bare base table.
+	bool ResolvePushedTable(const TableRef &ref, const Identifier &effective_alias, vector<PushedTable> &out);
+	//! The catalog columns of one base table, in declared order. False on the declines the
+	//! exhaustive projection loop already made: an unresolvable entry, a non-table entry, zero
+	//! logical columns.
+	bool ResolveTableColumnNames(const BaseTableRef &base, vector<Identifier> &out);
 
 	//! An aggregate over the pushed side that decomposes into a partial computed at the source
 	//! and a merge computed at the master.
