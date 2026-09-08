@@ -1661,20 +1661,34 @@ void RemotePushdownOptimizer::ApplyPartialAggregatesInExpression(unique_ptr<Pars
 		unique_ptr<ParsedExpression> merged =
 		    make_uniq<FunctionExpression>(Identifier(agg.merge_function), std::move(children));
 		if (agg.zero_default) {
-			// COUNT(*) becomes COALESCE(sum(__fed_aN.__fedagg_0), 0). Without this an ungrouped
-			// count whose fragment returned no rows yields NULL, because the merge is SUM. The
-			// coalesce is a no-op whenever any partial row exists, so it only affects the empty
-			// case it exists for.
+			// COUNT(*) becomes COALESCE(CAST(sum(__fed_aN.__fedagg_0) AS BIGINT), 0). Two things
+			// happen here, both only for the count family.
+			//
+			// The COALESCE: without it an ungrouped count whose fragment returned no rows yields
+			// NULL, because the merge is SUM. It is a no-op whenever any partial row exists, so it
+			// only affects the empty case it exists for.
+			//
+			// The CAST: count(x) is BIGINT and sum(BIGINT) is HUGEINT, so the merge alone would
+			// change the query's result type - JDBC reports Types.OTHER and BigInteger instead of
+			// BIGINT and Long, and CREATE TABLE AS materialises a HUGEINT column. The cast goes
+			// INSIDE the coalesce so the select item stays the OperatorExpression the rest of this
+			// pass already handles, and so the 0 default is typed by the same BIGINT. SUM's own
+			// widening is correct - a local sum(BIGINT) is HUGEINT too - and is left alone.
 			//
 			// COALESCE is an operator in DuckDB, not a catalog scalar function - building it as a
 			// FunctionExpression fails to bind with "Scalar Function with name coalesce does not exist".
 			auto coalesce = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
-			coalesce->GetChildrenMutable().push_back(std::move(merged));
+			coalesce->GetChildrenMutable().push_back(
+			    make_uniq<CastExpression>(LogicalType::BIGINT, std::move(merged)));
 			coalesce->GetChildrenMutable().push_back(make_uniq<ConstantExpression>(Value::BIGINT(0)));
 			merged = std::move(coalesce);
 		}
-		// Keep the original output name so the result column is unchanged
-		merged->SetAlias(expr->GetAlias());
+		// Keep the original output name so the result column is unchanged. GetName() rather than
+		// GetAlias(): an unaliased aggregate has an empty alias, and leaving it empty lets the
+		// rewritten `COALESCE(sum(__fed_a0.__fedagg_0), 0)` become the user-visible column label
+		// that a JDBC client reads from getColumnLabel. GetName() falls back to the original
+		// expression's own text, which is exactly what an unrewritten query would have reported.
+		merged->SetAlias(expr->GetName());
 		expr = std::move(merged);
 		return;
 	}
@@ -1685,7 +1699,16 @@ void RemotePushdownOptimizer::ApplyPartialAggregatesInExpression(unique_ptr<Pars
 void RemotePushdownOptimizer::ApplyPartialAggregates(SelectNode &node, const PartialAggregatePlan &plan,
                                                     const Identifier &fragment_alias) {
 	for (auto &expr : node.select_list) {
+		// An aggregate nested inside a larger select item is rewritten in place, and an unaliased
+		// item takes its output name from the whole rewritten tree - so `sum(o.amt) / 2` would be
+		// labelled `(sum(__fed_a0.__fedagg_0) / 2)` even though the aggregate node under it kept
+		// its own name. Pin the name the item had before the rewrite. Nothing to do when the item
+		// *is* the aggregate: it has an alias by then, set below.
+		const auto original_name = expr ? expr->GetName() : Identifier();
 		ApplyPartialAggregatesInExpression(expr, plan, fragment_alias);
+		if (expr && expr->GetAlias().empty() && expr->GetName() != original_name) {
+			expr->SetAlias(original_name);
+		}
 	}
 	if (node.having) {
 		ApplyPartialAggregatesInExpression(node.having, plan, fragment_alias);
