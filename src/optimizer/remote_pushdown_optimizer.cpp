@@ -11,6 +11,8 @@
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
@@ -383,6 +385,15 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(SelectNode &node) {
 	// this function. Remember where our own entries begin so nested scopes stay independent.
 	const auto pending_join_sides_base = pushdown_state.pending_join_sides.size();
 
+	// Every alias this node's FROM clause introduces, collected before anything is pushed. A
+	// LATERAL subquery is a sibling FROM item, so the alias it correlates to lives in this set.
+	// Rewrite(JoinRef) reads it to tell an outer reference from a struct field access.
+	identifier_set_t scope_aliases;
+	if (node.from_table) {
+		CollectTableAliases(*node.from_table, scope_aliases);
+	}
+	pushdown_state.select_scope_aliases.push_back(std::move(scope_aliases));
+
 	auto from_result = CatalogPushdownResult::NoCatalogReference();
 	if (node.from_table) {
 		from_result = Rewrite(node.from_table);
@@ -448,8 +459,118 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(SelectNode &node) {
 		PushCrossCatalogJoinSides(node, pending_join_sides_base);
 	}
 	pushdown_state.pending_join_sides.resize(pending_join_sides_base);
+	if (!pushdown_state.select_scope_aliases.empty()) {
+		pushdown_state.select_scope_aliases.pop_back();
+	}
 
 	return result;
+}
+
+//! A fragment is standalone SQL for one source, so every table it names must be defined inside
+//! it. The check is deliberately asymmetric: a qualifier missing from `own` only counts as an
+//! outer reference when it appears in `enclosing`. That is what keeps `struct_col.field` - which
+//! is indistinguishable from `table.column` before binding - from causing a false decline.
+void RemotePushdownOptimizer::CollectOuterReferencesInExpression(const ParsedExpression &expr,
+                                                                const identifier_set_t &own,
+                                                                const identifier_set_t &enclosing, bool &found) {
+	if (found) {
+		return;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &col_ref = expr.Cast<ColumnRefExpression>();
+		auto &names = col_ref.ColumnNames();
+		if (names.size() >= 2) {
+			const auto &qualifier = names[names.size() - 2];
+			if (own.find(qualifier) == own.end() && enclosing.find(qualifier) != enclosing.end()) {
+				found = true;
+				return;
+			}
+		}
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subq = expr.Cast<SubqueryExpression>();
+		if (subq.Subquery() && subq.Subquery()->node) {
+			CollectOuterReferences(*subq.Subquery()->node, own, enclosing, found);
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		CollectOuterReferencesInExpression(child, own, enclosing, found);
+	});
+}
+
+void RemotePushdownOptimizer::CollectOuterReferencesInTableRef(const TableRef &ref, const identifier_set_t &own,
+                                                              const identifier_set_t &enclosing, bool &found) {
+	if (found) {
+		return;
+	}
+	switch (ref.type) {
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		if (join.left) {
+			CollectOuterReferencesInTableRef(*join.left, own, enclosing, found);
+		}
+		if (join.right) {
+			CollectOuterReferencesInTableRef(*join.right, own, enclosing, found);
+		}
+		if (join.condition) {
+			CollectOuterReferencesInExpression(*join.condition, own, enclosing, found);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY: {
+		auto &sq = ref.Cast<SubqueryRef>();
+		if (sq.subquery && sq.subquery->node) {
+			CollectOuterReferences(*sq.subquery->node, own, enclosing, found);
+		}
+		break;
+	}
+	case TableReferenceType::TABLE_FUNCTION: {
+		auto &tf = ref.Cast<TableFunctionRef>();
+		if (tf.function) {
+			CollectOuterReferencesInExpression(*tf.function, own, enclosing, found);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+void RemotePushdownOptimizer::CollectOuterReferences(const QueryNode &node, const identifier_set_t &own,
+                                                    const identifier_set_t &enclosing, bool &found) {
+	if (found || node.type != QueryNodeType::SELECT_NODE) {
+		return;
+	}
+	auto &select = node.Cast<SelectNode>();
+	for (auto &expr : select.select_list) {
+		if (expr) {
+			CollectOuterReferencesInExpression(*expr, own, enclosing, found);
+		}
+	}
+	if (select.where_clause) {
+		CollectOuterReferencesInExpression(*select.where_clause, own, enclosing, found);
+	}
+	for (auto &expr : select.groups.group_expressions) {
+		if (expr) {
+			CollectOuterReferencesInExpression(*expr, own, enclosing, found);
+		}
+	}
+	if (select.having) {
+		CollectOuterReferencesInExpression(*select.having, own, enclosing, found);
+	}
+	if (select.qualify) {
+		CollectOuterReferencesInExpression(*select.qualify, own, enclosing, found);
+	}
+	if (select.from_table) {
+		CollectOuterReferencesInTableRef(*select.from_table, own, enclosing, found);
+	}
+}
+
+bool RemotePushdownOptimizer::SubtreeIsSelfContained(const TableRef &ref, const identifier_set_t &own,
+                                                     const identifier_set_t &enclosing) {
+	bool found = false;
+	CollectOuterReferencesInTableRef(ref, own, enclosing, found);
+	return !found;
 }
 
 void RemotePushdownOptimizer::CollectTableAliases(const TableRef &ref, identifier_set_t &aliases) {
@@ -669,8 +790,20 @@ bool RemotePushdownOptimizer::CollectGroupableBaseTables(
 	case TableReferenceType::JOIN: {
 		auto &join = ref.Cast<JoinRef>();
 		// Only a plain inner join is safe to collapse: an outer join's NULL-extension
-		// interacts with the filters that were pushed into the fragment.
-		if (join.type != JoinType::INNER || join.ref_type != JoinRefType::REGULAR) {
+		// interacts with the filters that were pushed into the fragment. A comma join is an
+		// inner join written without an ON clause - `FROM a, b` parses as JoinRefType::CROSS
+		// with JoinType::INNER - so it collapses on the same argument. What it does NOT carry
+		// is a reason to collapse: see CrossJoinSubtreeIsConnected.
+		if (join.type != JoinType::INNER) {
+			return false;
+		}
+		if (join.ref_type == JoinRefType::CROSS) {
+			// A CROSS with a condition or a USING list is a tree JoinRef::ToString cannot
+			// render (`a , b ON (...)` is not SQL), so nothing may be built from one
+			if (join.condition || !join.using_columns.empty()) {
+				return false;
+			}
+		} else if (join.ref_type != JoinRefType::REGULAR) {
 			return false;
 		}
 		if (!join.left || !join.right) {
@@ -681,6 +814,275 @@ bool RemotePushdownOptimizer::CollectGroupableBaseTables(
 	default:
 		return false;
 	}
+}
+
+bool RemotePushdownOptimizer::SubtreeHasCrossJoin(const TableRef &ref) {
+	if (ref.type != TableReferenceType::JOIN) {
+		return false;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	if (join.ref_type == JoinRefType::CROSS) {
+		return true;
+	}
+	return (join.left && SubtreeHasCrossJoin(*join.left)) || (join.right && SubtreeHasCrossJoin(*join.right));
+}
+
+//! Disjoint-set forest over the aliases of one grouped subtree
+namespace {
+class AliasComponents {
+public:
+	explicit AliasComponents(const identifier_set_t &aliases) {
+		for (auto &alias : aliases) {
+			index[alias] = parent.size();
+			parent.push_back(parent.size());
+		}
+	}
+
+	idx_t Find(idx_t i) {
+		while (parent[i] != i) {
+			parent[i] = parent[parent[i]];
+			i = parent[i];
+		}
+		return i;
+	}
+
+	void Connect(idx_t a, idx_t b) {
+		a = Find(a);
+		b = Find(b);
+		if (a != b) {
+			parent[a] = b;
+		}
+	}
+
+	optional_idx IndexOf(const Identifier &alias) {
+		auto entry = index.find(alias);
+		if (entry == index.end()) {
+			return optional_idx();
+		}
+		return optional_idx(entry->second);
+	}
+
+	bool SingleComponent() {
+		if (parent.empty()) {
+			return false;
+		}
+		auto root = Find(0);
+		for (idx_t i = 1; i < parent.size(); i++) {
+			if (Find(i) != root) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+private:
+	identifier_map_t<idx_t> index;
+	vector<idx_t> parent;
+};
+
+//! Every alias of the subtree an expression references. Only qualified references count: an
+//! unqualified one is attributed - or refused - before this runs, by QualifyUnqualifiedColumnRefs.
+void CollectReferencedAliases(const ParsedExpression &expr, AliasComponents &components, vector<idx_t> &out) {
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() >= 2) {
+			auto found = components.IndexOf(names[names.size() - 2]);
+			if (found.IsValid()) {
+				out.push_back(found.GetIndex());
+			}
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { CollectReferencedAliases(child, components, out); });
+}
+
+//! The first alias of the subtree found under `ref`, for wiring one side of a join to the other
+optional_idx FirstAliasIndex(const TableRef &ref, AliasComponents &components) {
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base = ref.Cast<BaseTableRef>();
+		return components.IndexOf(base.alias.empty() ? base.Table() : base.alias);
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		if (join.left) {
+			auto left = FirstAliasIndex(*join.left, components);
+			if (left.IsValid()) {
+				return left;
+			}
+		}
+		if (join.right) {
+			return FirstAliasIndex(*join.right, components);
+		}
+		return optional_idx();
+	}
+	default:
+		return optional_idx();
+	}
+}
+
+//! A join carrying an ON condition or a USING list connects everything under its left to
+//! everything under its right. A comma join connects nothing, which is the whole point.
+void AddStructuralEdges(const TableRef &ref, AliasComponents &components) {
+	if (ref.type != TableReferenceType::JOIN) {
+		return;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	if (join.left) {
+		AddStructuralEdges(*join.left, components);
+	}
+	if (join.right) {
+		AddStructuralEdges(*join.right, components);
+	}
+	if (!join.condition && join.using_columns.empty()) {
+		return;
+	}
+	if (!join.left || !join.right) {
+		return;
+	}
+	auto left = FirstAliasIndex(*join.left, components);
+	auto right = FirstAliasIndex(*join.right, components);
+	if (left.IsValid() && right.IsValid()) {
+		components.Connect(left.GetIndex(), right.GetIndex());
+	}
+}
+} // namespace
+
+bool RemotePushdownOptimizer::CrossJoinSubtreeIsConnected(TableRef &ref, SelectNode &node,
+                                                          const identifier_set_t &aliases) {
+	AliasComponents components(aliases);
+	AddStructuralEdges(ref, components);
+	// Only the conjuncts that travel with the fragment. One left at the master joins nothing at
+	// the source, so counting it would let a Cartesian product through on a predicate the source
+	// never sees.
+	if (node.where_clause) {
+		vector<reference<ParsedExpression>> conjuncts;
+		CollectConjuncts(*node.where_clause, conjuncts);
+		for (auto &conjunct : conjuncts) {
+			if (!CanPushConjunctTo(conjunct.get(), aliases)) {
+				continue;
+			}
+			vector<idx_t> referenced;
+			CollectReferencedAliases(conjunct.get(), components, referenced);
+			for (idx_t i = 1; i < referenced.size(); i++) {
+				components.Connect(referenced[0], referenced[i]);
+			}
+		}
+	}
+	return components.SingleComponent();
+}
+
+//===--------------------------------------------------------------------===//
+// The fan-out guard
+//===--------------------------------------------------------------------===//
+//
+// Grouping is not free. Grouped, the source runs the join and returns one WIDE row per output
+// row; separate, each table returns its own rows carrying only its own columns. For a
+// foreign-key join the output is about the larger side, so grouped costs
+// max(rows) x sum(widths) against sum(rows x width) - the small side's columns duplicated onto
+// every row of the big side. Grouping such a join is therefore a structural loss unless
+// something above it collapses the result, which is what PushRemoteSubtreeAggregated is for.
+//
+// THIS IS NOT A COST MODEL, and the comparison is deliberately unavailable rather than
+// approximate wherever the shape stops holding:
+//
+//   * a table whose row count the source did not declare makes it unavailable, and the
+//     grouping then behaves exactly as it did before this existed. Unset means the source has
+//     no opinion, not zero rows;
+//   * a conjunct that travels with the fragment and restricts ONE of its tables makes the
+//     output unknown and potentially far below max(rows) - which is where grouping earns its
+//     keep - so it is unavailable there too. A conjunct joining two of the grouped tables is
+//     not a restriction: it is what makes max(rows) the answer.
+//
+// What it cannot see is join selectivity, so a join more selective than its shape says will
+// sometimes be declined when grouping it would have won. That costs bytes and never
+// correctness, the same trade CrossJoinSubtreeIsConnected makes above.
+
+namespace {
+
+//! What one fragment costs on the wire beyond the values it carries, counted in cells so it can
+//! be compared against a row x column product. Grouping saves one such envelope per table it
+//! absorbs, and that is the whole reason the comparison is not just a row count: on tables of a
+//! few rows the saved envelope dominates and grouping is the cheaper plan even when the join
+//! duplicates a column.
+//!
+//! Measured: the smallest fragment in the TPC-H suite carries one row of one column and 344 B,
+//! against a nominal 8 B per cell. Only the ratio matters, and the cases the guard decides sit
+//! orders of magnitude either side of it: TPC-H Q18 duplicates 108,000 cells across the
+//! customer/orders seam, and a three-row fixture duplicates three.
+constexpr double FRAGMENT_ENVELOPE_CELLS = 43;
+
+//! Every alias of `aliases` that a qualified column reference in `expr` names
+void CollectQualifierAliases(const ParsedExpression &expr, const identifier_set_t &aliases, identifier_set_t &out) {
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() >= 2) {
+			auto &qualifier = names[names.size() - 2];
+			if (aliases.find(qualifier) != aliases.end()) {
+				out.insert(qualifier);
+			}
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { CollectQualifierAliases(child, aliases, out); });
+}
+
+} // namespace
+
+bool RemotePushdownOptimizer::GroupingShipsMoreThanSeparateTables(
+    const vector<std::pair<Identifier, reference<BaseTableRef>>> &tables, SelectNode &node,
+    const identifier_set_t &pushed_aliases) {
+	// A restriction travelling with the fragment reduces the join by an amount nothing here can
+	// estimate, so the comparison is unavailable and the grouping stands.
+	if (node.where_clause) {
+		vector<reference<ParsedExpression>> conjuncts;
+		CollectConjuncts(*node.where_clause, conjuncts);
+		for (auto &conjunct : conjuncts) {
+			if (!CanPushConjunctTo(conjunct.get(), pushed_aliases)) {
+				continue;
+			}
+			identifier_set_t referenced;
+			CollectQualifierAliases(conjunct.get(), pushed_aliases, referenced);
+			if (referenced.size() == 1) {
+				return false;
+			}
+		}
+	}
+	// Doubles rather than idx_t: this is an estimate, every input is an exact integer well
+	// inside a double's range, and a source is free to declare a row count whose product with a
+	// column count would overflow.
+	double widest_rows = 0;
+	double total_width = 0;
+	double separate_cells = 0;
+	for (auto &entry : tables) {
+		auto &base = entry.second.get();
+		Identifier catalog_name;
+		vector<Identifier> schema_path;
+		ResolveQualification(base.GetQualifiedName(), catalog_name, schema_path);
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, base.Table());
+		auto entry_ptr = LookupEntry(catalog_name, lookup, schema_path);
+		if (!entry_ptr || entry_ptr->type != CatalogType::TABLE_ENTRY) {
+			return false;
+		}
+		auto &table = entry_ptr->Cast<TableCatalogEntry>();
+		const auto width = table.GetColumns().LogicalColumnCount();
+		if (width == 0) {
+			return false;
+		}
+		auto storage = table.GetStorageInfo(binder.context);
+		if (!storage.cardinality.IsValid()) {
+			return false;
+		}
+		const auto rows = storage.cardinality.GetIndex();
+		widest_rows = MaxValue<double>(widest_rows, static_cast<double>(rows));
+		total_width += static_cast<double>(width);
+		separate_cells += static_cast<double>(rows) * static_cast<double>(width);
+	}
+	const double grouped = widest_rows * total_width + FRAGMENT_ENVELOPE_CELLS;
+	const double separate = separate_cells + static_cast<double>(tables.size()) * FRAGMENT_ENVELOPE_CELLS;
+	return grouped > separate;
 }
 
 void RemotePushdownOptimizer::RequalifyColumnRefsInExpression(unique_ptr<ParsedExpression> &expr,
@@ -1136,6 +1538,17 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref
 			return false;
 		}
 	}
+	// A comma join is only worth grouping when something joins it. Without this the fragment for
+	// `FROM a, b` with no predicate between them asks the source for a * b rows, where pushing the
+	// two tables separately ships a + b - correct either way, and arbitrarily worse.
+	if (SubtreeHasCrossJoin(*ref) && !CrossJoinSubtreeIsConnected(*ref, node, pushed_aliases)) {
+		return false;
+	}
+	// And a join whose output is about its larger side ships the small side's columns on every
+	// row of the big one, which two fragments do not. See the fan-out guard above.
+	if (GroupingShipsMoreThanSeparateTables(tables, node, pushed_aliases)) {
+		return false;
+	}
 
 	// Project "alias.column AS alias__column" for the columns of the subtree's tables the
 	// enclosing node still references, or for all of them when the collection cannot decide.
@@ -1374,7 +1787,17 @@ bool RemotePushdownOptimizer::AllJoinsAreInner(const TableRef &ref) {
 		return true;
 	}
 	auto &join = ref.Cast<JoinRef>();
-	if (join.type != JoinType::INNER || join.ref_type != JoinRefType::REGULAR) {
+	// A comma join is an inner join with no ON clause, so it does not NULL-extend and
+	// pre-aggregation stays valid over it. Anything else - outer, NATURAL, ASOF, POSITIONAL -
+	// declines.
+	if (join.type != JoinType::INNER) {
+		return false;
+	}
+	if (join.ref_type == JoinRefType::CROSS) {
+		if (join.condition || !join.using_columns.empty()) {
+			return false;
+		}
+	} else if (join.ref_type != JoinRefType::REGULAR) {
 		return false;
 	}
 	if (join.left && !AllJoinsAreInner(*join.left)) {
@@ -1384,6 +1807,34 @@ bool RemotePushdownOptimizer::AllJoinsAreInner(const TableRef &ref) {
 		return false;
 	}
 	return true;
+}
+
+bool RemotePushdownOptimizer::NodeHasPositionalReference(const SelectNode &node) {
+	// Read off the node's own SQL text rather than by walking the tree. A walk has to name every
+	// position a `#n` can sit in - select list, GROUP BY, HAVING, QUALIFY, WHERE, DISTINCT ON,
+	// ORDER BY, LIMIT, a join condition, an aggregate's arguments - and one it forgets pre-aggregates
+	// silently. ToString renders the whole node, so a reference cannot be in the tree and absent
+	// from the text without breaking DuckDB's own SQL round trip.
+	string sql;
+	vector<SimplifiedToken> tokens;
+	try {
+		sql = node.ToString();
+		tokens = Parser::Tokenize(sql);
+	} catch (std::exception &) {
+		return true;
+	}
+	for (auto &token : tokens) {
+		// `#` lexes as an operator and the index as the numeric constant right after it. Asking the
+		// lexer is what stops `'#2'` in a string literal and `"a#b"` as a quoted identifier from
+		// spoofing one; requiring the digit keeps the `#>` JSON operators out.
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR || token.start + 1 >= sql.size()) {
+			continue;
+		}
+		if (sql[token.start] == '#' && StringUtil::CharacterIsDigit(sql[token.start + 1])) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool RemotePushdownOptimizer::NodeHasWindow(const SelectNode &node) {
@@ -1553,6 +2004,14 @@ bool RemotePushdownOptimizer::PlanPartialAggregate(const SelectNode &node, const
 	}
 	// Pre-aggregation changes the multiplicity a NULL-extending join observes
 	if (!node.from_table || !AllJoinsAreInner(*node.from_table)) {
+		return false;
+	}
+	// A `#n` binds by position over the FROM clause, which this rewrite rebuilds: the side becomes
+	// one fragment ref projecting group keys and partials, of a different width and in a different
+	// order. There is no pre-bind attribution for a positional reference, so the only safe reading
+	// is to decline the whole strategy and leave the query on the plain-pushdown path, where the
+	// fragment's projection preserves the positions. Costs bytes; the alternative is wrong rows.
+	if (NodeHasPositionalReference(node)) {
 		return false;
 	}
 
@@ -1775,6 +2234,11 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeAggregated(unique_ptr<TableRef> &
 	if (pushed_aliases.empty()) {
 		return false;
 	}
+	// The same Cartesian-product guard PushRemoteSubtreeGrouped applies. The aggregate collapses
+	// what arrives at the master, not what the source has to build.
+	if (SubtreeHasCrossJoin(*ref) && !CrossJoinSubtreeIsConnected(*ref, node, pushed_aliases)) {
+		return false;
+	}
 
 	PartialAggregatePlan plan;
 	if (!PlanPartialAggregate(node, pushed_aliases, plan)) {
@@ -1838,71 +2302,261 @@ bool RemotePushdownOptimizer::PushRemoteSubtreeAggregated(unique_ptr<TableRef> &
 	return true;
 }
 
-void RemotePushdownOptimizer::StripCatalogPrefix(ParsedExpression &expr, const Identifier &catalog_name) {
+void RemotePushdownOptimizer::StripCatalogPrefix(ParsedExpression &expr, const Identifier &catalog_name,
+                               const identifier_set_t &pushed_aliases) {
 	// Unlike StripCatalogName, which normalises to exactly table.column because the whole
 	// statement is moving to the source, this removes only the leading catalog identifier. The
 	// rest of the path has to survive: `rpc.t.s.a.b.c` is a struct walk, and taking the last two
 	// names would leave `b.c` and lose the column.
+	//
+	// A schema qualifier goes too, and `pushed_aliases` is what tells one from a struct field.
+	// After the catalog is gone `rpc.main.t.id` reads `main.t.id`, which binds against nothing:
+	// the side is a fragment now, bound under the table's own name. `rpc.t.s.a.b.c` reads
+	// `t.s.a.b.c`, where the same position holds the table. So the second name being a pushed
+	// alias while the first is not is exactly the schema case, and nothing else is touched.
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(
 	    expr, [&](ColumnRefExpression &col_ref) {
 		    auto &names = col_ref.ColumnNamesMutable();
 		    if (names.size() >= 3 && names[0] == catalog_name) {
 			    names.erase(names.begin());
 		    }
+		    if (names.size() >= 3 && pushed_aliases.find(names[0]) == pushed_aliases.end() &&
+		        pushed_aliases.find(names[1]) != pushed_aliases.end()) {
+			    names.erase(names.begin());
+		    }
 	    });
 }
 
-void RemotePushdownOptimizer::StripCatalogFromJoinConditions(optional_ptr<TableRef> ref,
-                                                             const Identifier &catalog_name) {
+void RemotePushdownOptimizer::StripCatalogFromJoinConditions(optional_ptr<TableRef> ref, const Identifier &catalog_name,
+                                                             const identifier_set_t &pushed_aliases) {
 	if (!ref || ref->type != TableReferenceType::JOIN) {
 		return;
 	}
 	auto &join = ref->Cast<JoinRef>();
 	if (join.condition) {
-		StripCatalogPrefix(*join.condition, catalog_name);
+		StripCatalogPrefix(*join.condition, catalog_name, pushed_aliases);
 	}
-	StripCatalogFromJoinConditions(join.left.get(), catalog_name);
-	StripCatalogFromJoinConditions(join.right.get(), catalog_name);
+	StripCatalogFromJoinConditions(join.left.get(), catalog_name, pushed_aliases);
+	StripCatalogFromJoinConditions(join.right.get(), catalog_name, pushed_aliases);
 }
 
-void RemotePushdownOptimizer::StripCatalogFromNodeExpressions(SelectNode &node, const Identifier &catalog_name) {
+void RemotePushdownOptimizer::StripCatalogFromNodeExpressions(SelectNode &node, const Identifier &catalog_name,
+                                                        const identifier_set_t &pushed_aliases) {
 	// Only the expressions. The FROM tree's own table names are left alone, because a table of
 	// this catalog that was not pushed still has to resolve through its catalog.
 	for (auto &expr : node.select_list) {
 		if (expr) {
-			StripCatalogPrefix(*expr, catalog_name);
+			StripCatalogPrefix(*expr, catalog_name, pushed_aliases);
 		}
 	}
 	if (node.where_clause) {
-		StripCatalogPrefix(*node.where_clause, catalog_name);
+		StripCatalogPrefix(*node.where_clause, catalog_name, pushed_aliases);
 	}
 	for (auto &expr : node.groups.group_expressions) {
 		if (expr) {
-			StripCatalogPrefix(*expr, catalog_name);
+			StripCatalogPrefix(*expr, catalog_name, pushed_aliases);
 		}
 	}
 	if (node.having) {
-		StripCatalogPrefix(*node.having, catalog_name);
+		StripCatalogPrefix(*node.having, catalog_name, pushed_aliases);
 	}
 	if (node.qualify) {
-		StripCatalogPrefix(*node.qualify, catalog_name);
+		StripCatalogPrefix(*node.qualify, catalog_name, pushed_aliases);
 	}
-	for (auto &modifier : node.modifiers) {
-		if (!modifier || modifier->type != ResultModifierType::ORDER_MODIFIER) {
+	// Every modifier, not just ORDER BY. `DISTINCT ON (rpc.t1.i)` over a mixed join used to keep
+	// the catalog prefix and fail to bind, and enumerating rather than listing the modifier types
+	// is what stops the next modifier being forgotten the same way.
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &child) {
+		if (child) {
+			StripCatalogPrefix(*child, catalog_name, pushed_aliases);
+		}
+	});
+	StripCatalogFromJoinConditions(node.from_table.get(), catalog_name, pushed_aliases);
+}
+
+//===--------------------------------------------------------------------===//
+// Attributing an unqualified column reference to a FROM item
+//===--------------------------------------------------------------------===//
+//
+// TPC-H writes `o_orderdate >= DATE '1994-01-01'`, and everything in this file reads a
+// reference's qualifier to decide which side it belongs to. Rather than teach each of those
+// places to resolve a bare name, this pass resolves it once and rewrites the tree, so a
+// conjunct, a select item and a join condition are all attributed by the code that already
+// works. What it must never do is attribute a name to the wrong FROM item: that pushes a
+// predicate to a source holding different data and returns a wrong answer, where refusing
+// only ships more bytes.
+//
+// The rule: a one-part name is rewritten only when EXACTLY ONE FROM item of the scope declares
+// a column of that name, every FROM item's columns are known, and the name cannot mean anything
+// other than that column. Six refusals, each for its own reason:
+//
+//   * a FROM item whose columns cannot be established - a subquery, a table function, a CTE
+//     name, a positional column alias list, a relation the catalog does not hold. The name
+//     might be its column, so the whole scope declines rather than that one item.
+//   * a name declared by two or more FROM items. DuckDB itself rejects most of these as
+//     ambiguous, but a USING or NATURAL join makes one legal and resolves it to a coalesced
+//     column belonging to neither side alone.
+//   * any USING clause, and any join that is not REGULAR or CROSS. NATURAL changes which
+//     columns a relation even exposes, and USING replaces two columns with one.
+//   * a name that is also a select-list alias. DuckDB resolves a bare name in WHERE against
+//     the select list as well, so `SELECT x*2 AS y ... WHERE y > 1` does not mean the column.
+//   * a name that is also a relation name in the scope. `SELECT o FROM orders o` is the whole
+//     row as a struct, not a column called o.
+//   * a repeated alias in the scope. The qualifier this pass would write is then itself
+//     ambiguous.
+//
+// Nothing here enters a subquery, in an expression or in the FROM clause: an inner scope has
+// its own FROM items and gets its own pass, and a name this scope cannot resolve may well be a
+// correlated reference to an outer one - which is exactly the case that must decline.
+
+bool RemotePushdownOptimizer::CollectScopeRelations(const TableRef &ref, vector<ScopeRelation> &out) {
+	switch (ref.type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base = ref.Cast<BaseTableRef>();
+		if (!base.column_name_alias.empty()) {
+			// The names the query sees are the positional aliases, not the catalog's
+			return false;
+		}
+		ScopeRelation relation;
+		relation.alias = base.alias.empty() ? base.Table() : base.alias;
+		if (!ResolveTableColumnNames(base, relation.columns)) {
+			// A CTE name, a view the catalog does not hold, an unresolvable table
+			return false;
+		}
+		out.push_back(std::move(relation));
+		return true;
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref.Cast<JoinRef>();
+		if (join.ref_type != JoinRefType::REGULAR && join.ref_type != JoinRefType::CROSS) {
+			return false;
+		}
+		if (!join.using_columns.empty()) {
+			return false;
+		}
+		if (!join.left || !join.right) {
+			return false;
+		}
+		return CollectScopeRelations(*join.left, out) && CollectScopeRelations(*join.right, out);
+	}
+	default:
+		return false;
+	}
+}
+
+void RemotePushdownOptimizer::QualifyColumnRefsInExpression(unique_ptr<ParsedExpression> &expr,
+                                                            const identifier_map_t<Identifier> &resolvable) {
+	if (!expr) {
+		return;
+	}
+	if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expr->Cast<ColumnRefExpression>().ColumnNamesMutable();
+		if (names.size() != 1) {
+			return;
+		}
+		auto entry = resolvable.find(names[0]);
+		if (entry == resolvable.end()) {
+			return;
+		}
+		auto column = names[0];
+		names.clear();
+		names.push_back(entry->second);
+		names.push_back(column);
+		return;
+	}
+	// EnumerateChildren does not enter a subquery's own query node, which is what keeps an inner
+	// scope's names out of this one
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { QualifyColumnRefsInExpression(child, resolvable); });
+}
+
+void RemotePushdownOptimizer::QualifyColumnRefsInTableRef(TableRef &ref,
+                                                          const identifier_map_t<Identifier> &resolvable) {
+	// The join conditions belong to this scope and are not reachable through the node's
+	// expression lists. An explicit walk, for the reason RequalifyColumnRefsInTableRef gives.
+	if (ref.type != TableReferenceType::JOIN) {
+		return;
+	}
+	auto &join = ref.Cast<JoinRef>();
+	QualifyColumnRefsInExpression(join.condition, resolvable);
+	if (join.left) {
+		QualifyColumnRefsInTableRef(*join.left, resolvable);
+	}
+	if (join.right) {
+		QualifyColumnRefsInTableRef(*join.right, resolvable);
+	}
+}
+
+void RemotePushdownOptimizer::QualifyUnqualifiedColumnRefs(SelectNode &node) {
+	if (!node.from_table) {
+		return;
+	}
+	vector<ScopeRelation> relations;
+	if (!CollectScopeRelations(*node.from_table, relations) || relations.size() < 2) {
+		// One FROM item resolves every bare name on its own, and there is then no side to
+		// attribute it to that it is not already on
+		return;
+	}
+	// A repeated alias makes the qualifier this pass writes ambiguous in its turn
+	identifier_set_t aliases;
+	for (auto &relation : relations) {
+		if (!aliases.insert(relation.alias).second) {
+			return;
+		}
+	}
+	// column name -> the last relation declaring it, and how many relations declare it
+	identifier_map_t<Identifier> owner;
+	identifier_map_t<idx_t> declared_by;
+	for (auto &relation : relations) {
+		for (auto &column : relation.columns) {
+			declared_by[column]++;
+			owner[column] = relation.alias;
+		}
+	}
+	identifier_map_t<const ParsedExpression *> select_aliases;
+	CollectSelectListAliases(node, select_aliases);
+
+	identifier_map_t<Identifier> resolvable;
+	for (auto &entry : declared_by) {
+		if (entry.second != 1) {
 			continue;
 		}
-		for (auto &order : modifier->Cast<OrderModifier>().orders) {
-			if (order.expression) {
-				StripCatalogPrefix(*order.expression, catalog_name);
-			}
+		if (select_aliases.find(entry.first) != select_aliases.end()) {
+			continue;
 		}
+		if (aliases.find(entry.first) != aliases.end()) {
+			continue;
+		}
+		resolvable[entry.first] = owner[entry.first];
 	}
-	StripCatalogFromJoinConditions(node.from_table.get(), catalog_name);
+	if (resolvable.empty()) {
+		return;
+	}
+
+	for (auto &expr : node.select_list) {
+		QualifyColumnRefsInExpression(expr, resolvable);
+	}
+	QualifyColumnRefsInExpression(node.where_clause, resolvable);
+	for (auto &expr : node.groups.group_expressions) {
+		QualifyColumnRefsInExpression(expr, resolvable);
+	}
+	QualifyColumnRefsInExpression(node.having, resolvable);
+	QualifyColumnRefsInExpression(node.qualify, resolvable);
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(
+	    node, [&](unique_ptr<ParsedExpression> &child) { QualifyColumnRefsInExpression(child, resolvable); });
+	QualifyColumnRefsInTableRef(*node.from_table, resolvable);
 }
 
 void RemotePushdownOptimizer::PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base) {
 	// Only the entries this SelectNode recorded - earlier ones belong to enclosing scopes
 	auto &pending_sides = pushdown_state.pending_join_sides;
+	if (pending_base >= pending_sides.size()) {
+		// No side to push, so no reason to touch the node's expressions
+		return;
+	}
+	// Runs before the first side moves, while the FROM clause still holds the base tables every
+	// bare name has to be resolved against
+	QualifyUnqualifiedColumnRefs(node);
 	for (idx_t i = pending_base; i < pending_sides.size(); i++) {
 		auto &pending = pending_sides[i];
 		if (!pending.ref_slot || !*pending.ref_slot) {
@@ -1919,7 +2573,7 @@ void RemotePushdownOptimizer::PushCrossCatalogJoinSides(SelectNode &node, idx_t 
 		// list entry, still says `catalog.table.column` and would fail to bind. Normalising those
 		// to `table.column` is what upstream does for whole-statement pushdown.
 		if (pending.result.catalog) {
-			StripCatalogFromNodeExpressions(node, pending.result.catalog->GetName());
+			StripCatalogFromNodeExpressions(node, pending.result.catalog->GetName(), pending.aliases);
 		}
 	}
 }
@@ -2459,17 +3113,28 @@ CatalogPushdownResult RemotePushdownOptimizer::Rewrite(JoinRef &ref) {
 	// A side that names a CTE is declined: only the enclosing statement carries the WITH clause,
 	// so a fragment built from the side alone would name a CTE the source has never seen.
 	if (result.reference_type == CatalogReferenceType::UNKNOWN_CATALOG_REFERENCE) {
+		// The aliases the enclosing FROM clause introduces, which is what makes an outer reference
+		// recognisable. Empty when a join is analysed outside any SelectNode scope, in which case
+		// nothing can be shown to be an outer reference and the check passes.
+		static const identifier_set_t no_enclosing;
+		const auto &enclosing = pushdown_state.select_scope_aliases.empty()
+		                            ? no_enclosing
+		                            : pushdown_state.select_scope_aliases.back();
 		if (left_result.reference_type == CatalogReferenceType::SINGLE_REMOTE_CATALOG &&
 		    !left_refers_to_cte) {
 			PendingRemoteJoinSide pending {&ref.left, left_result, {}};
 			CollectTableAliases(*ref.left, pending.aliases);
-			pushdown_state.pending_join_sides.push_back(std::move(pending));
+			if (SubtreeIsSelfContained(*ref.left, pending.aliases, enclosing)) {
+				pushdown_state.pending_join_sides.push_back(std::move(pending));
+			}
 		}
 		if (right_result.reference_type == CatalogReferenceType::SINGLE_REMOTE_CATALOG &&
 		    !right_refers_to_cte) {
 			PendingRemoteJoinSide pending {&ref.right, right_result, {}};
 			CollectTableAliases(*ref.right, pending.aliases);
-			pushdown_state.pending_join_sides.push_back(std::move(pending));
+			if (SubtreeIsSelfContained(*ref.right, pending.aliases, enclosing)) {
+				pushdown_state.pending_join_sides.push_back(std::move(pending));
+			}
 		}
 	}
 

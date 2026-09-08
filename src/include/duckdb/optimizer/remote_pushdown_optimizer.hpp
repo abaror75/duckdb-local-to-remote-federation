@@ -98,6 +98,11 @@ struct RemotePushdownState {
 	vector<PendingRemoteJoinSide> pending_join_sides;
 	//! Names the alias of each grouped multi-table fragment (__fed_j0, __fed_j1, ...)
 	idx_t grouped_fragment_counter = 0;
+	//! One entry per SelectNode scope currently open, holding every alias that scope's FROM
+	//! clause introduces. Pushed before the FROM clause is walked, so a LATERAL subquery's
+	//! correlation target is in the set. Read by SubtreeIsSelfContained, which needs the
+	//! enclosing scope's aliases to tell an outer reference from a struct field access.
+	vector<identifier_set_t> select_scope_aliases;
 	//! Every fragment ref this pushdown has already installed in the tree. Read by the projection
 	//! collection, which has to tell such a leaf apart from a FROM item it does not understand: a
 	//! fragment is a TableFunctionRef, and an unrecognised table function declines pruning.
@@ -217,6 +222,19 @@ private:
 
 	//! Collect the table aliases (or table names when unaliased) visible under a TableRef subtree.
 	static void CollectTableAliases(const TableRef &ref, identifier_set_t &aliases);
+	//! True when nothing under `ref` references a relation outside it. A fragment is standalone
+	//! SQL for one source, so a subtree correlating to a sibling FROM item of the enclosing scope
+	//! cannot be pushed on its own. Deliberately asymmetric: a qualifier missing from `own` only
+	//! counts when it appears in `enclosing`, which is what keeps `struct_col.field` - not
+	//! distinguishable from `table.column` before binding - from causing a false decline.
+	static bool SubtreeIsSelfContained(const TableRef &ref, const identifier_set_t &own,
+	                                   const identifier_set_t &enclosing);
+	static void CollectOuterReferences(const QueryNode &node, const identifier_set_t &own,
+	                                   const identifier_set_t &enclosing, bool &found);
+	static void CollectOuterReferencesInExpression(const ParsedExpression &expr, const identifier_set_t &own,
+	                                               const identifier_set_t &enclosing, bool &found);
+	static void CollectOuterReferencesInTableRef(const TableRef &ref, const identifier_set_t &own,
+	                                             const identifier_set_t &enclosing, bool &found);
 	//! True when every column reference in expr is qualified by an alias in aliases, there is at
 	//! least one such reference, and the expression is safe to evaluate remotely.
 	//! Not static: needs the catalog to test function volatility.
@@ -234,6 +252,26 @@ private:
 	//! only reference that side. Called from RewriteNode(SelectNode) where the WHERE is visible.
 	//! Only pending entries at or after pending_base are processed.
 	void PushCrossCatalogJoinSides(SelectNode &node, idx_t pending_base);
+
+	//! One FROM item of the enclosing scope, and the columns it provides
+	struct ScopeRelation {
+		Identifier alias;
+		vector<Identifier> columns;
+	};
+	//! Attribute every unqualified column reference in this node to the FROM item that provides
+	//! it, by rewriting `o_orderdate` into `orders.o_orderdate` in place. Everything downstream -
+	//! CanPushConjunctTo, RequalifyColumnRefs, AttributeColumnRef, CollectPushedColumns - decides
+	//! which side a reference belongs to by reading its qualifier, so doing the attribution once
+	//! here is what makes all of them work on SQL written without qualifiers. Every uncertain
+	//! case leaves the reference alone, which is the behaviour from before this existed.
+	void QualifyUnqualifiedColumnRefs(SelectNode &node);
+	//! Every FROM item of the scope with its catalog columns. False as soon as one item's columns
+	//! cannot be established, because an unqualified name might then belong to it.
+	bool CollectScopeRelations(const TableRef &ref, vector<ScopeRelation> &out);
+	//! Rewrite one-part column references named in `resolvable` to `<owner>.<column>`
+	static void QualifyColumnRefsInExpression(unique_ptr<ParsedExpression> &expr,
+	                                          const identifier_map_t<Identifier> &resolvable);
+	static void QualifyColumnRefsInTableRef(TableRef &ref, const identifier_map_t<Identifier> &resolvable);
 	//! Push a remote subtree that binds several tables as ONE fragment, so the join between
 	//! them executes at the source. Returns false when the grouped form cannot be built (an
 	//! unresolvable column list, a non-base-table leaf, ...) and the caller should fall back
@@ -241,8 +279,32 @@ private:
 	bool PushRemoteSubtreeGrouped(unique_ptr<TableRef> &ref, CatalogPushdownResult result, SelectNode &node);
 	//! Collect the base tables under a subtree together with the alias each is bound to.
 	//! Returns false if the subtree contains anything other than base tables and inner joins.
+	//! A comma join (JoinRefType::CROSS) counts as an inner join here; whether it is worth
+	//! grouping is a separate question that CrossJoinSubtreeIsConnected answers.
 	static bool CollectGroupableBaseTables(TableRef &ref,
 	                                       vector<std::pair<Identifier, reference<BaseTableRef>>> &tables);
+	//! True when a comma join appears anywhere in the subtree.
+	static bool SubtreeHasCrossJoin(const TableRef &ref);
+	//! True when every table of a subtree containing a comma join is reachable from every other
+	//! through a join condition inside the subtree or through a conjunct that travels with the
+	//! fragment. A comma join with nothing joining it is a Cartesian product, and grouping one
+	//! asks the source to materialise N x M rows where pushing the tables separately ships N + M.
+	//! Not static: the predicate edges are exactly the conjuncts CanPushConjunctTo admits.
+	bool CrossJoinSubtreeIsConnected(TableRef &ref, SelectNode &node, const identifier_set_t &aliases);
+	//! True when one fragment carrying the join ships more than one fragment per table would,
+	//! judged on the row counts the sources declared at ATTACH and the columns each table
+	//! declares. Only ever declines a grouping, so a wrong answer here costs bytes.
+	//!
+	//! Grouped, the source returns one wide row per join output row; separate, each table
+	//! returns its own rows carrying only its own columns. On a foreign key the output is about
+	//! the larger side, so grouped costs max(rows) x sum(widths) against sum(rows x width).
+	//!
+	//! False - group, as before - whenever the comparison is unavailable: a table whose row
+	//! count the source did not declare, or a conjunct travelling with the fragment that
+	//! restricts one of its tables and reduces the join by an unknown amount. Not a cost model:
+	//! see the block comment in the .cpp for what it cannot see.
+	bool GroupingShipsMoreThanSeparateTables(const vector<std::pair<Identifier, reference<BaseTableRef>>> &tables,
+	                                         SelectNode &node, const identifier_set_t &pushed_aliases);
 	//! Rewrite every "alias.column" in the enclosing node to "fragment_alias.alias__column"
 	//! so it binds against the flattened, prefix-projected remote result.
 	static void RequalifyColumnRefs(SelectNode &node, const identifier_set_t &pushed_aliases,
@@ -391,6 +453,12 @@ private:
 	static bool AllJoinsAreInner(const TableRef &ref);
 	//! True if the node contains a window function, which needs per-row detail
 	static bool NodeHasWindow(const SelectNode &node);
+	//! True if the node contains a positional reference (`#n`) anywhere. `#n` binds by position
+	//! over the FROM clause, and pre-aggregation rebuilds that clause with a fragment of a
+	//! different width in a different order, so every position moves. Read off the node's own
+	//! rendered SQL through DuckDB's lexer rather than by walking the tree: a walk has to name
+	//! every position a `#n` can sit in, and one it forgets pre-aggregates silently.
+	static bool NodeHasPositionalReference(const SelectNode &node);
 	//! Record a pushed-side column once, preserving first-seen order
 	//! Returns false when alias__column collides with an already-recorded pair, which
 	//! disqualifies the side rather than silently projecting the same name twice.
@@ -441,9 +509,12 @@ private:
 	//! Normalise catalog-qualified column references in a node's expressions to table.column,
 	//! after a join side of that catalog has been replaced by a fragment. The FROM tree's table
 	//! names are deliberately untouched.
-	static void StripCatalogFromNodeExpressions(SelectNode &node, const Identifier &catalog_name);
-	static void StripCatalogPrefix(ParsedExpression &expr, const Identifier &catalog_name);
-	static void StripCatalogFromJoinConditions(optional_ptr<TableRef> ref, const Identifier &catalog_name);
+	static void StripCatalogFromNodeExpressions(SelectNode &node, const Identifier &catalog_name,
+	                                            const identifier_set_t &pushed_aliases);
+	static void StripCatalogPrefix(ParsedExpression &expr, const Identifier &catalog_name,
+	                               const identifier_set_t &pushed_aliases);
+	static void StripCatalogFromJoinConditions(optional_ptr<TableRef> ref, const Identifier &catalog_name,
+	                                           const identifier_set_t &pushed_aliases);
 	bool RefersToLocalTable(const ColumnRefExpression &col_ref) const;
 
 	bool RefersToCTE(const Identifier &cte_name, CatalogPushdownResult &result) const;
