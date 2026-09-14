@@ -1,0 +1,51 @@
+# name: test/sql/optimizer/remote_pushdown/extension_handler.test
+# description: An extension can add a pushdown strategy through RemotePushdownHandler
+# group: [remote_pushdown]
+
+# DuckDB pushes nothing down when a join's two sides live in different catalogs. The strategy that
+# handles it lives in test/extension/fake_remote, not in src/optimizer: it is installed through
+# create_remote_pushdown_handler and acts from JoinAnalyzed. What it needs from the optimizer is four
+# things, and those four are the whole public surface this branch adds.
+#
+# The fake catalog answers RemoteExecute with the SQL it was sent, as one VARCHAR row, so each query
+# below shows the fragment the extension built.
+
+statement ok
+ATTACH ':memory:' AS ext (TYPE fake_remote);
+
+statement ok
+CREATE TABLE ext.t(id INTEGER, val INTEGER);
+
+statement ok
+CREATE TABLE local_t(id INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO local_t VALUES (1, 'x');
+
+# The join spans two catalogs, so DuckDB leaves it alone. The extension sends the remote side, and the
+# catalog name is gone from the fragment because the catalog running it is the one that was named.
+query II
+SELECT t.fragment_sql, local_t.note FROM ext.t, local_t;
+----
+SELECT * FROM t	x
+
+# Same with the sides written the other way round
+query II
+SELECT t.fragment_sql, local_t.note FROM local_t, ext.t;
+----
+SELECT * FROM t	x
+
+# A join wholly inside one remote catalog is DuckDB's own case; the extension does not interfere
+statement ok
+CREATE TABLE ext.u(id INTEGER, tag VARCHAR);
+
+query I
+SELECT count(*) FROM (SELECT 1) x;
+----
+1
+
+# A purely local join is untouched
+query I
+SELECT count(*) FROM local_t a, local_t b;
+----
+1
