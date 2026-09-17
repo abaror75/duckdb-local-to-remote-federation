@@ -1383,15 +1383,17 @@ void RemotePushdownOptimizer::StripCatalogName(TableRef &ref, const Identifier &
 void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &col_ref = expr.Cast<ColumnRefExpression>();
-		// Strip catalog prefix from qualified column references, normalising to exactly table.col (2 parts).
+		// Remove only the leading catalog identifier; everything after it has to survive.
 		// Require at least 3 names: a 2-part ref like "rpc.field" is either table.col or struct-column.field —
 		// not catalog-qualified — so stripping would be wrong.
-		// For 3-part  catalog.table.col        → table.col   (one level stripped)
-		// For 4-part  catalog.schema.table.col → table.col   (catalog + schema stripped)
-		if (col_ref.ColumnNames().size() >= 3 && col_ref.ColumnNames()[0] == catalog_name) {
-			Identifier table_name = col_ref.ColumnNames()[col_ref.ColumnNames().size() - 2];
-			Identifier col_name = col_ref.ColumnNames()[col_ref.ColumnNames().size() - 1];
-			col_ref.ColumnNamesMutable() = {std::move(table_name), std::move(col_name)};
+		// For 3-part  catalog.table.col          → table.col
+		// For 4-part  catalog.schema.table.col   → schema.table.col
+		// For n-part  catalog.table.s.a.b.c      → table.s.a.b.c   (a walk into a nested struct)
+		// The 4-part and n-part shapes are lexically indistinguishable, so the tail cannot be
+		// interpreted here; dropping all but the last two names loses the column in the n-part case.
+		auto &names = col_ref.ColumnNamesMutable();
+		if (names.size() >= 3 && names[0] == catalog_name) {
+			names.erase(names.begin());
 		}
 		return;
 	}

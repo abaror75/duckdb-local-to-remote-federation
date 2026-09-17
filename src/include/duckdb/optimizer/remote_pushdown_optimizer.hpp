@@ -149,9 +149,9 @@ public:
 	                                       const vector<Identifier> &schema_path);
 	//! Replace a query node with a scan of the remote catalog that executes it
 	unique_ptr<TableRef> CreateRemoteFunctionRef(CatalogPushdownResult &result, unique_ptr<QueryNode> node);
-	//! Drop the catalog name from a node that is about to be sent to that catalog, which is already
-	//! running it and cannot resolve its own name. The overloads for statements, table refs and DDL
-	//! stay private: a handler works on query nodes, and the rest are reachable through this one.
+	//! Drop the catalog name from a node about to be sent to that catalog, which is already running it
+	//! and cannot resolve its own name. The overloads for statements, table refs and DDL stay private:
+	//! a handler works on query nodes, and the rest are reached through this one.
 	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name);
 
 private:
@@ -162,6 +162,8 @@ private:
 	//! Strip catalog prefix from expression column refs. When strip_subquery_bodies=false, leaves subquery
 	//! bodies untouched (used for partial pushdown where inner subqueries are not being pushed).
 	static void StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name);
+
+private:
 	void FindRemoteCatalogsInSearchPath();
 	CatalogPushdownResult Rewrite(QueryNode &node);
 	//! The per-type query node handlers are deliberately NOT overloads of Rewrite: calling
