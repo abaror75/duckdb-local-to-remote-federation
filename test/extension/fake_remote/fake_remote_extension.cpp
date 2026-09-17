@@ -97,17 +97,17 @@ public:
 			return;
 		}
 		auto &slot = left_remote ? ref.left : ref.right;
-		auto &result = left_remote ? analysis.left : analysis.right;
 		if (!slot || slot->type != TableReferenceType::BASE_TABLE) {
 			return;
 		}
-		SendAsFragment(optimizer, slot, const_cast<CatalogPushdownResult &>(result));
+		// A copy, because the analysis is handed out read-only and CreateRemoteFunctionRef takes it mutably
+		auto result = left_remote ? analysis.left : analysis.right;
+		SendAsFragment(optimizer, slot, result);
 	}
 
 private:
 	//! "SELECT * FROM <table>", stripped of the catalog name and handed back as a scan.
-	void SendAsFragment(RemotePushdownOptimizer &optimizer, unique_ptr<TableRef> &slot,
-	                    CatalogPushdownResult &result) {
+	void SendAsFragment(RemotePushdownOptimizer &optimizer, unique_ptr<TableRef> &slot, CatalogPushdownResult &result) {
 		auto &table = slot->Cast<BaseTableRef>();
 		auto fragment = make_uniq<SelectNode>();
 		fragment->select_list.push_back(make_uniq<StarExpression>());
