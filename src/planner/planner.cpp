@@ -1,4 +1,6 @@
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/main/database_manager.hpp"
 
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -238,12 +240,58 @@ shared_ptr<PreparedStatementData> Planner::PrepareSQLStatement(unique_ptr<SQLSta
 	return prepared_data;
 }
 
+//! Whether anything could rewrite the statement before it is bound. Only then is a copy worth keeping.
+static bool StatementRewriteIsPossible(ClientContext &context) {
+	return DatabaseManager::Get(context).GetRemoteCatalogCount() > 0;
+}
+
 void Planner::CreatePlan(unique_ptr<SQLStatement> statement) {
 	D_ASSERT(statement);
+	// A statement rewrite runs before binding, and a rewrite that gets something wrong turns a working
+	// query into an error. That is never a trade worth making: not pushing work to a remote source
+	// costs time, while a query that will not bind costs the answer. So keep the statement as written,
+	// and if the rewritten one cannot be planned, plan the original instead.
+	//
+	// Only kept when there is a rewrite that could fail - a remote catalog attached, or an extension
+	// with a statement hook - so an ordinary session copies nothing.
+	unique_ptr<SQLStatement> as_written;
+	if (StatementRewriteIsPossible(context)) {
+		as_written = statement->Copy();
+	}
 	Optimizer optimizer(*binder, context);
 	optimizer.OptimizeStatement(statement);
+	if (as_written) {
+		try {
+			CreatePlanForStatement(*statement);
+			return;
+		} catch (std::exception &ex) {
+			// Only the errors a malformed rewrite produces. A rewrite that names a column that is not
+			// there, or a relation the scope does not declare, fails in the binder, the catalog or the
+			// parser - so those we retry without it.
+			//
+			// Everything else is left alone deliberately. A source that will not connect, a permission
+			// that is refused, an out-of-memory: those are true and the user needs to see them. Falling
+			// back there would turn a configuration problem into a silent change of behaviour, which is
+			// a different kind of wrong from the one this guard exists to prevent.
+			ErrorData error(ex);
+			const auto type = error.Type();
+			if (type != ExceptionType::BINDER && type != ExceptionType::CATALOG &&
+			    type != ExceptionType::PARSER) {
+				throw;
+			}
+			// Plan the statement the user wrote. If that throws too, the error they see is their own,
+			// which is the one they can act on.
+			plan.reset();
+			binder = Binder::CreateBinder(context);
+			statement = std::move(as_written);
+		}
+	}
+	CreatePlanForStatement(*statement);
+}
 
-	switch (statement->type) {
+void Planner::CreatePlanForStatement(SQLStatement &statement_ref) {
+	auto &statement = statement_ref;
+	switch (statement.type) {
 	case StatementType::SELECT_STATEMENT:
 	case StatementType::INSERT_STATEMENT:
 	case StatementType::COPY_STATEMENT:
@@ -273,10 +321,10 @@ void Planner::CreatePlan(unique_ptr<SQLStatement> statement) {
 	case StatementType::CONNECT_STATEMENT:
 	case StatementType::DISCONNECT_STATEMENT:
 	case StatementType::EXTERNAL_RESOURCE_STATEMENT:
-		CreatePlan(*statement);
+		CreatePlan(statement);
 		break;
 	default:
-		throw NotImplementedException("Cannot plan statement of type %s!", StatementTypeToString(statement->type));
+		throw NotImplementedException("Cannot plan statement of type %s!", StatementTypeToString(statement.type));
 	}
 }
 

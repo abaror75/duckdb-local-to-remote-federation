@@ -2,6 +2,7 @@ include_directories(../third_party/catch)
 include_directories(../third_party/sqlite/include)
 include_directories(include)
 include_directories(extension/debug_fs/include)
+include_directories(extension/fake_remote/include)
 
 # Allows loading tests from registered extensions
 include_directories("${PROJECT_BINARY_DIR}/codegen/include/")

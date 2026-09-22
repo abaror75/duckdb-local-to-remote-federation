@@ -8,6 +8,7 @@
 #include "duckdb/common/enums/on_entry_not_found.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -76,6 +77,10 @@ CatalogPushdownResult CatalogPushdownResult::RemoteReference(Catalog &catalog) {
 
 RemotePushdownOptimizer::RemotePushdownOptimizer(Binder &binder)
     : binder(binder), owned_pushdown_state(make_uniq<RemotePushdownState>()), pushdown_state(*owned_pushdown_state) {
+	auto &config = DBConfig::GetConfig(binder.context);
+	if (config.create_remote_pushdown_handler) {
+		pushdown_state.handler = config.create_remote_pushdown_handler();
+	}
 }
 
 RemotePushdownOptimizer::RemotePushdownOptimizer(optional_ptr<RemotePushdownOptimizer> parent_p)
@@ -376,6 +381,9 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(RecursiveCTENode &nod
 }
 
 CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(SelectNode &node) {
+	if (pushdown_state.handler) {
+		pushdown_state.handler->EnterSelectNode(*this, node);
+	}
 	auto from_result = CatalogPushdownResult::NoCatalogReference();
 	if (node.from_table) {
 		from_result = Rewrite(node.from_table);
@@ -433,6 +441,9 @@ CatalogPushdownResult RemotePushdownOptimizer::RewriteNode(SelectNode &node) {
 		default:
 			break;
 		}
+	}
+	if (pushdown_state.handler) {
+		pushdown_state.handler->ExitSelectNode(*this, node, result);
 	}
 	return result;
 }
@@ -951,13 +962,24 @@ CatalogPushdownResult RemotePushdownOptimizer::Rewrite(TableFunctionRef &ref) {
 }
 
 CatalogPushdownResult RemotePushdownOptimizer::Rewrite(JoinRef &ref) {
+	const auto cte_refs_before_left = pushdown_state.cte_reference_count;
 	auto left_result = Rewrite(ref.left);
+	const auto cte_refs_before_right = pushdown_state.cte_reference_count;
 
 	// the right side of a join can be correlated to the left side - use a child optimizer to track this
 	RemotePushdownOptimizer child_optimizer(this);
 	auto right_result = child_optimizer.Rewrite(ref.right);
 
 	auto result = Merge(left_result, right_result);
+	if (pushdown_state.handler) {
+		JoinSideAnalysis analysis;
+		analysis.left = left_result;
+		analysis.right = right_result;
+		analysis.merged = result;
+		analysis.left_references_cte = cte_refs_before_right != cte_refs_before_left;
+		analysis.right_references_cte = pushdown_state.cte_reference_count != cte_refs_before_right;
+		pushdown_state.handler->JoinAnalyzed(*this, ref, analysis);
+	}
 	// Also analyze the join condition - it may contain subqueries or local macro calls
 	// that affect whether the join can be pushed as a whole.
 	if (ref.condition) {
@@ -1013,6 +1035,7 @@ CatalogPushdownResult RemotePushdownOptimizer::Rewrite(BaseTableRef &ref) {
 	if (catalog_name.empty() && schema_path.empty()) {
 		CatalogPushdownResult pushdown_result;
 		if (RefersToCTE(ref.Table(), pushdown_result)) {
+			pushdown_state.cte_reference_count++;
 			if (pushdown_result.reference_type == CatalogReferenceType::UNKNOWN_CATALOG_REFERENCE) {
 				// Local/unknown CTE - track as local for correlated subquery detection
 				TrackLocalTable(ref);
@@ -1360,15 +1383,17 @@ void RemotePushdownOptimizer::StripCatalogName(TableRef &ref, const Identifier &
 void RemotePushdownOptimizer::StripCatalogName(ParsedExpression &expr, const Identifier &catalog_name) {
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &col_ref = expr.Cast<ColumnRefExpression>();
-		// Strip catalog prefix from qualified column references, normalising to exactly table.col (2 parts).
+		// Remove only the leading catalog identifier; everything after it has to survive.
 		// Require at least 3 names: a 2-part ref like "rpc.field" is either table.col or struct-column.field —
 		// not catalog-qualified — so stripping would be wrong.
-		// For 3-part  catalog.table.col        → table.col   (one level stripped)
-		// For 4-part  catalog.schema.table.col → table.col   (catalog + schema stripped)
-		if (col_ref.ColumnNames().size() >= 3 && col_ref.ColumnNames()[0] == catalog_name) {
-			Identifier table_name = col_ref.ColumnNames()[col_ref.ColumnNames().size() - 2];
-			Identifier col_name = col_ref.ColumnNames()[col_ref.ColumnNames().size() - 1];
-			col_ref.ColumnNamesMutable() = {std::move(table_name), std::move(col_name)};
+		// For 3-part  catalog.table.col          → table.col
+		// For 4-part  catalog.schema.table.col   → schema.table.col
+		// For n-part  catalog.table.s.a.b.c      → table.s.a.b.c   (a walk into a nested struct)
+		// The 4-part and n-part shapes are lexically indistinguishable, so the tail cannot be
+		// interpreted here; dropping all but the last two names loses the column in the n-part case.
+		auto &names = col_ref.ColumnNamesMutable();
+		if (names.size() >= 3 && names[0] == catalog_name) {
+			names.erase(names.begin());
 		}
 		return;
 	}

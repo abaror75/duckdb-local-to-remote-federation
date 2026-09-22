@@ -44,6 +44,9 @@ public:
 
 private:
 	void CreatePlan(SQLStatement &statement);
+	//! Bind and plan one statement. Split out so CreatePlan can try the rewritten statement and fall
+	//! back to the statement as written.
+	void CreatePlanForStatement(SQLStatement &statement);
 	shared_ptr<PreparedStatementData> PrepareSQLStatement(unique_ptr<SQLStatement> statement);
 };
 } // namespace duckdb
