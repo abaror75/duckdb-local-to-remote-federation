@@ -24,7 +24,9 @@ unique_ptr<TableRef> SqlAsTable(const string &sql) {
 	ref->expected_names = {Identifier("fragment_sql")};
 	ref->expected_types = {LogicalType::VARCHAR};
 	vector<unique_ptr<ParsedExpression>> row;
-	row.push_back(make_uniq<ConstantExpression>(Value(sql)));
+	// `ConstantExpression(const Value &)` is deleted as of v2.0.0: a Value is not a literal, and
+	// the factory for a string literal is what the deletion points at.
+	row.push_back(ConstantExpression::String(sql));
 	ref->values.push_back(std::move(row));
 	ref->alias = Identifier("fake_remote_fragment");
 	return std::move(ref);

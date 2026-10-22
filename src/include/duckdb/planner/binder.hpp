@@ -313,6 +313,7 @@ public:
 	unique_ptr<BoundPragmaInfo> BindPragma(PragmaInfo &info, QueryErrorContext error_context);
 
 	BoundStatement Bind(TableRef &ref);
+	BoundStatement BindTableRef(TableRef &ref);
 
 	//! Generates an unused index for a table
 	TableIndex GenerateTableIndex();

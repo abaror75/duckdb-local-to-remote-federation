@@ -1,6 +1,7 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/optimizer/remote_pushdown_optimizer.hpp"
 
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -324,8 +325,12 @@ void Planner::CreatePlan(unique_ptr<SQLStatement> statement) {
 			// a different kind of wrong from the one this guard exists to prevent.
 			ErrorData error(ex);
 			const auto type = error.Type();
-			if (type != ExceptionType::BINDER && type != ExceptionType::CATALOG &&
-			    type != ExceptionType::PARSER) {
+			if (type != ExceptionType::BINDER && type != ExceptionType::CATALOG && type != ExceptionType::PARSER) {
+				throw;
+			}
+			// An error the remote raised is the remote's answer, not a malformed rewrite: report it. By
+			// now the remote may have acted on the statement, so planning it again locally is not safe.
+			if (error.ExtraInfo().count(RemotePushdownOptimizer::REMOTE_ERROR_KEY)) {
 				throw;
 			}
 			// Plan the statement the user wrote. If that throws too, the error they see is their own,

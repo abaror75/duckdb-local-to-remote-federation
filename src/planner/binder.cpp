@@ -8,6 +8,8 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/optimizer/remote_pushdown_optimizer.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -146,6 +148,23 @@ BoundStatement Binder::Bind(QueryNode &node) {
 }
 
 BoundStatement Binder::Bind(TableRef &ref) {
+	auto remote_origin = RemotePushdownOptimizer::GetRemoteOrigin(ref);
+	if (!remote_origin.empty()) {
+		// a ref a remote catalog produced: binding it may run the pushed work on the remote, so an error
+		// raised here is tagged as the remote's, which the planner reports rather than retries
+		try {
+			return BindTableRef(ref);
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			auto extra_info = error.ExtraInfo();
+			extra_info[RemotePushdownOptimizer::REMOTE_ERROR_KEY] = remote_origin;
+			throw Exception(extra_info, error.Type(), error.RawMessage());
+		}
+	}
+	return BindTableRef(ref);
+}
+
+BoundStatement Binder::BindTableRef(TableRef &ref) {
 	for (auto &column_alias : ref.column_name_alias) {
 		if (column_alias.empty()) {
 			throw BinderException(ref, "column alias cannot be empty");

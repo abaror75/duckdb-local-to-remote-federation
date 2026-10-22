@@ -149,13 +149,21 @@ public:
 	                                       const vector<Identifier> &schema_path);
 	//! Replace a query node with a scan of the remote catalog that executes it
 	unique_ptr<TableRef> CreateRemoteFunctionRef(CatalogPushdownResult &result, unique_ptr<QueryNode> node);
+	//! Key of the error extra info naming the remote catalog an error came from. An error carrying it was
+	//! raised by the remote, not by a rewrite, so the planner reports it instead of retrying without the rewrite
+	static constexpr const char *REMOTE_ERROR_KEY = "remote_catalog";
+	//! Record on a ref that it was produced by a remote catalog, so errors raised while binding it are tagged
+	static void MarkRemoteOrigin(TableRef &ref, const Identifier &catalog_name);
+	//! The remote catalog that produced this ref, or empty when it was not produced by one
+	static string GetRemoteOrigin(const TableRef &ref);
 	//! Drop the catalog name from a node about to be sent to that catalog, which is already running it
-	//! and cannot resolve its own name. The overloads for statements, table refs and DDL stay private:
-	//! a handler works on query nodes, and the rest are reached through this one.
+	//! and cannot resolve its own name. A handler works on query nodes; the statement overload is
+	//! public because the binder calls it (bind_create.cpp), and the table-ref and DDL overloads stay
+	//! private and are reached through these two.
 	static void StripCatalogName(QueryNode &node, const Identifier &catalog_name);
+	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name);
 
 private:
-	static void StripCatalogName(SQLStatement &statement, const Identifier &catalog_name);
 	static void StripCatalogName(TableRef &ref, const Identifier &catalog_name);
 	static void StripCatalogName(CreateInfo &info, const Identifier &catalog_name);
 	static void StripCatalogName(AlterInfo &info, const Identifier &catalog_name);

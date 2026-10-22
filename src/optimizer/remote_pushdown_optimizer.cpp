@@ -39,6 +39,7 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/main/external_dependencies.hpp"
 #include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -1323,7 +1324,41 @@ CatalogPushdownResult RemotePushdownOptimizer::Rewrite(unique_ptr<ParsedExpressi
 
 unique_ptr<TableRef> RemotePushdownOptimizer::CreateRemoteFunctionRef(CatalogPushdownResult &result,
                                                                       unique_ptr<QueryNode> node) {
-	return result.catalog->RemoteExecute(binder.context, std::move(node));
+	auto ref = result.catalog->RemoteExecute(binder.context, std::move(node));
+	if (ref) {
+		MarkRemoteOrigin(*ref, result.catalog->GetName());
+	}
+	return ref;
+}
+
+namespace {
+//! Marks a ref as produced by a remote catalog; see RemotePushdownOptimizer::MarkRemoteOrigin
+class RemoteOriginDependency : public DependencyItem {
+public:
+	explicit RemoteOriginDependency(string catalog_name_p) : catalog_name(std::move(catalog_name_p)) {
+	}
+	string catalog_name;
+};
+constexpr const char *REMOTE_ORIGIN_DEPENDENCY = "remote_pushdown_origin";
+} // namespace
+
+void RemotePushdownOptimizer::MarkRemoteOrigin(TableRef &ref, const Identifier &catalog_name) {
+	if (!ref.external_dependency) {
+		ref.external_dependency = make_shared_ptr<ExternalDependency>();
+	}
+	ref.external_dependency->AddDependency(REMOTE_ORIGIN_DEPENDENCY,
+	                                       make_shared_ptr<RemoteOriginDependency>(catalog_name.GetIdentifierName()));
+}
+
+string RemotePushdownOptimizer::GetRemoteOrigin(const TableRef &ref) {
+	if (!ref.external_dependency) {
+		return string();
+	}
+	auto item = ref.external_dependency->GetDependency(REMOTE_ORIGIN_DEPENDENCY);
+	if (!item) {
+		return string();
+	}
+	return item->Cast<RemoteOriginDependency>().catalog_name;
 }
 
 //! Drop the catalog qualifier from a name. A two-part name (e.g. "rpc.t") parses as schema.name, so the
@@ -1891,7 +1926,11 @@ void RemotePushdownOptimizer::FinishPushdown(unique_ptr<SQLStatement> &statement
 		return;
 	}
 	// a statement that is not built around a query node (DDL) is shipped to the remote as a whole
-	statement = WrapRemoteRef(result.catalog->RemoteExecute(binder.context, std::move(statement)));
+	auto remote_ref = result.catalog->RemoteExecute(binder.context, std::move(statement));
+	if (remote_ref) {
+		MarkRemoteOrigin(*remote_ref, result.catalog->GetName());
+	}
+	statement = WrapRemoteRef(std::move(remote_ref));
 }
 
 void RemotePushdownOptimizer::FinishPushdown(unique_ptr<QueryNode> &node, CatalogPushdownResult result) {
