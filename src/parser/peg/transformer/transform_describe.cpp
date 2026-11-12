@@ -54,8 +54,10 @@ unique_ptr<QueryNode> PEGTransformerFactory::TransformShowTables(PEGTransformer 
 	auto showref = make_uniq<ShowRef>();
 	showref->show_type = ShowType::SHOW_FROM;
 	if (!IsInvalidCatalog(qualified_name.Catalog())) {
-		throw ParserException("Expected \"SHOW TABLES FROM database\", \"SHOW TABLES FROM schema\", or "
-		                      "\"SHOW TABLES FROM database.schema\"");
+		// "SHOW TABLES FROM a.b.c": a nested schema path, optionally led by a database. The binder decides which leading
+		// part (if any) is the database. The path is kept whole, followed by an empty table name.
+		showref->qualified_name = QualifiedName(qualified_name.Path(), Identifier());
+		return WrapShowRef(std::move(showref));
 	}
 	if (IsInvalidSchema(qualified_name.Schema())) {
 		showref->SetSchemaName(qualified_name.Name());

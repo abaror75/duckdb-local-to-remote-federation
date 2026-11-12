@@ -126,9 +126,12 @@ QualifiedName PEGTransformerFactory::TransformSchemaReservedIndex(PEGTransformer
 
 QualifiedName PEGTransformerFactory::TransformCatalogReservedSchemaIndex(
     PEGTransformer &transformer, const Identifier &catalog_qualification,
-    const Identifier &reserved_schema_qualification, const Identifier &reserved_index_name) {
-	QualifiedName result(catalog_qualification, reserved_schema_qualification, reserved_index_name);
-	return result;
+    const vector<Identifier> &reserved_schema_qualification, const Identifier &reserved_index_name) {
+	// [catalog, schema, nested schema..., index], the same shape as a nested table name
+	vector<Identifier> qualification {catalog_qualification};
+	qualification.insert(qualification.end(), reserved_schema_qualification.begin(),
+	                     reserved_schema_qualification.end());
+	return QualifiedName(std::move(qualification), reserved_index_name);
 }
 
 unique_ptr<DropStatement>

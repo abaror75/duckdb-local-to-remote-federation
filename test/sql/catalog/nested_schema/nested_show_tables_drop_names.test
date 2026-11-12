@@ -1,0 +1,129 @@
+# name: test/sql/catalog/nested_schema/nested_show_tables_drop_names.test
+# description: SHOW TABLES FROM, DROP SEQUENCE and DROP INDEX take a nested schema path, with or without the database
+# group: [nested_schema]
+
+statement ok
+ATTACH ':memory:' AS lake;
+
+statement ok
+CREATE SCHEMA lake.s3tablescatalog;
+
+statement ok
+CREATE SCHEMA lake.s3tablescatalog.salesdemo;
+
+statement ok
+CREATE SCHEMA lake.s3tablescatalog.salesdemo.retail;
+
+statement ok
+CREATE TABLE lake.s3tablescatalog.salesdemo.retail.widget_sales(id INTEGER);
+
+statement ok
+CREATE VIEW lake.s3tablescatalog.salesdemo.retail.widget_view AS SELECT 1 AS id;
+
+statement ok
+CREATE TABLE lake.s3tablescatalog.salesdemo.top_level(id INTEGER);
+
+# a top-level schema with the same name as the nested one is not listed for the nested path
+statement ok
+CREATE SCHEMA lake.retail;
+
+statement ok
+CREATE TABLE lake.retail.other(id INTEGER);
+
+# database, then three schema levels
+query I
+SHOW TABLES FROM lake.s3tablescatalog.salesdemo.retail;
+----
+widget_sales
+widget_view
+
+# database, then two schema levels
+query I
+SHOW TABLES FROM lake.s3tablescatalog.salesdemo;
+----
+top_level
+
+# with lake as the current database, the schema path alone
+statement ok
+USE lake;
+
+query I
+SHOW TABLES FROM s3tablescatalog.salesdemo.retail;
+----
+widget_sales
+widget_view
+
+# two parts still mean a top-level schema of a database, or a nested schema of the current one
+query I
+SHOW TABLES FROM lake.retail;
+----
+other
+
+query I
+SHOW TABLES FROM s3tablescatalog.salesdemo;
+----
+top_level
+
+query I
+SHOW TABLES FROM retail;
+----
+other
+
+statement error
+SHOW TABLES FROM lake.s3tablescatalog.salesdemo.nope;
+----
+No catalog + schema named "lake.s3tablescatalog.salesdemo.nope" found
+
+statement error
+SHOW TABLES FROM s3tablescatalog.nope.retail;
+----
+No catalog + schema named "s3tablescatalog.nope.retail" found
+
+# DROP SEQUENCE takes the same paths as CREATE SEQUENCE
+statement ok
+CREATE SEQUENCE lake.s3tablescatalog.salesdemo.retail.seq;
+
+query I
+SELECT nextval('lake.s3tablescatalog.salesdemo.retail.seq');
+----
+1
+
+statement ok
+DROP SEQUENCE lake.s3tablescatalog.salesdemo.retail.seq;
+
+query I
+SELECT count(*) FROM duckdb_sequences() WHERE sequence_name = 'seq';
+----
+0
+
+statement ok
+CREATE SEQUENCE s3tablescatalog.salesdemo.retail.seq2;
+
+statement ok
+DROP SEQUENCE IF EXISTS s3tablescatalog.salesdemo.retail.seq2;
+
+statement ok
+DROP SEQUENCE IF EXISTS s3tablescatalog.salesdemo.retail.seq2;
+
+query I
+SELECT count(*) FROM duckdb_sequences() WHERE sequence_name = 'seq2';
+----
+0
+
+# DROP INDEX takes a nested schema path too
+statement ok
+CREATE INDEX idx_nested ON lake.s3tablescatalog.salesdemo.retail.widget_sales(id);
+
+statement ok
+DROP INDEX lake.s3tablescatalog.salesdemo.retail.idx_nested;
+
+statement ok
+CREATE INDEX idx_nested2 ON s3tablescatalog.salesdemo.retail.widget_sales(id);
+
+statement ok
+DROP INDEX IF EXISTS lake.s3tablescatalog.salesdemo.retail.idx_nested2;
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name LIKE 'idx_nested%';
+----
+0

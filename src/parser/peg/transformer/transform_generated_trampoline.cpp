@@ -5025,11 +5025,20 @@ PEGTransformerFactory::FinalizeAlterSequenceStmtTrampoline(PEGTransformer &trans
 void PEGTransformerFactory::InitializeQualifiedSequenceNameTrampoline(PEGTransformer &transformer,
                                                                       GeneratedTransformProcess &process) {
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
-	process.ReserveChildSlots(2);
-	auto &schema_qualification_opt = list_pr.GetChild(1).Cast<OptionalParseResult>();
-	if (schema_qualification_opt.HasResult()) {
-		process.PushChild({transformer.GetRule(PEGRuleId::SchemaQualification), schema_qualification_opt.GetResult()},
-		                  1);
+	auto &repeat_opt = list_pr.GetChild(1).Cast<OptionalParseResult>();
+	idx_t dynamic_child_count = 0;
+	if (repeat_opt.HasResult()) {
+		auto &repeat_pr = repeat_opt.GetResult().Cast<RepeatParseResult>();
+		auto repeat_children = repeat_pr.GetChildren();
+		dynamic_child_count = repeat_children.size();
+		process.ReserveChildSlots(2 + dynamic_child_count - 1);
+		for (idx_t i = repeat_children.size(); i > 0; i--) {
+			auto child_idx = i - 1;
+			process.PushChild({transformer.GetRule(PEGRuleId::SchemaQualification), repeat_children[child_idx].get()},
+			                  1 + child_idx);
+		}
+	} else {
+		process.ReserveChildSlots(2 - 1);
 	}
 	auto &catalog_qualification_opt = list_pr.GetChild(0).Cast<OptionalParseResult>();
 	if (catalog_qualification_opt.HasResult()) {
@@ -5042,13 +5051,25 @@ arena_ptr<TransformResultValue>
 PEGTransformerFactory::FinalizeQualifiedSequenceNameTrampoline(PEGTransformer &transformer,
                                                                GeneratedTransformProcess &process) {
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
+	idx_t dynamic_child_count = 0;
+	auto &dynamic_repeat_opt = list_pr.GetChild(1).Cast<OptionalParseResult>();
+	if (dynamic_repeat_opt.HasResult()) {
+		auto &dynamic_repeat_pr = dynamic_repeat_opt.GetResult().Cast<RepeatParseResult>();
+		auto dynamic_repeat_children = dynamic_repeat_pr.GetChildren();
+		dynamic_child_count = dynamic_repeat_children.size();
+	}
 	optional<Identifier> catalog_qualification {};
 	if (process.child_results[0]) {
 		catalog_qualification = process.TakeResult<Identifier>(0);
 	}
-	optional<Identifier> schema_qualification {};
-	if (process.child_results[1]) {
-		schema_qualification = process.TakeResult<Identifier>(1);
+	optional<vector<Identifier>> schema_qualification {};
+	if (dynamic_child_count > 0) {
+		vector<Identifier> schema_qualification_value;
+		schema_qualification_value.reserve(dynamic_child_count);
+		for (idx_t i = 1; i < 1 + dynamic_child_count; i++) {
+			schema_qualification_value.push_back(process.TakeResult<Identifier>(i));
+		}
+		schema_qualification = std::move(schema_qualification_value);
 	}
 	auto sequence_name = list_pr.GetChild(2).Cast<IdentifierParseResult>().identifier;
 	auto result =
@@ -12759,8 +12780,16 @@ PEGTransformerFactory::FinalizeSchemaReservedIndexTrampoline(PEGTransformer &tra
 void PEGTransformerFactory::InitializeCatalogReservedSchemaIndexTrampoline(PEGTransformer &transformer,
                                                                            GeneratedTransformProcess &process) {
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
-	process.ReserveChildSlots(2);
-	process.PushChild({transformer.GetRule(PEGRuleId::ReservedSchemaQualification), list_pr.GetChild(1)}, 1);
+	auto &repeat_pr = list_pr.GetChild(1).Cast<RepeatParseResult>();
+	auto repeat_children = repeat_pr.GetChildren();
+	auto dynamic_child_count = repeat_children.size();
+	process.ReserveChildSlots(2 + dynamic_child_count - 1);
+	for (idx_t i = repeat_children.size(); i > 0; i--) {
+		auto child_idx = i - 1;
+		process.PushChild(
+		    {transformer.GetRule(PEGRuleId::ReservedSchemaQualification), repeat_children[child_idx].get()},
+		    1 + child_idx);
+	}
 	process.PushChild({transformer.GetRule(PEGRuleId::CatalogQualification), list_pr.GetChild(0)}, 0);
 }
 
@@ -12768,8 +12797,15 @@ arena_ptr<TransformResultValue>
 PEGTransformerFactory::FinalizeCatalogReservedSchemaIndexTrampoline(PEGTransformer &transformer,
                                                                     GeneratedTransformProcess &process) {
 	auto &list_pr = process.parse_result.Cast<ListParseResult>();
+	auto &dynamic_repeat_pr = list_pr.GetChild(1).Cast<RepeatParseResult>();
+	auto dynamic_repeat_children = dynamic_repeat_pr.GetChildren();
+	auto dynamic_child_count = dynamic_repeat_children.size();
 	auto catalog_qualification = process.TakeResult<Identifier>(0);
-	auto reserved_schema_qualification = process.TakeResult<Identifier>(1);
+	vector<Identifier> reserved_schema_qualification;
+	reserved_schema_qualification.reserve(dynamic_child_count);
+	for (idx_t i = 1; i < 1 + dynamic_child_count; i++) {
+		reserved_schema_qualification.push_back(process.TakeResult<Identifier>(i));
+	}
 	auto reserved_index_name = list_pr.GetChild(2).Cast<IdentifierParseResult>().identifier;
 	auto result = TransformCatalogReservedSchemaIndex(transformer, catalog_qualification, reserved_schema_qualification,
 	                                                  reserved_index_name);

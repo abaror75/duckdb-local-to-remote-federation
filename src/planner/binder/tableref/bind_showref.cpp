@@ -175,6 +175,23 @@ BoundStatement Binder::BindDescribeTable(ShowRef &ref) {
 		      "ORDER BY all;";
 	} else if (lname == "\"tables\"") {
 		sql = PragmaShowTables();
+	} else if (ref.show_type == ShowType::SHOW_FROM && ref.qualified_name.Path().size() > 3) {
+		// "SHOW TABLES FROM a.b.c": the path before the empty table name is [database?, schema, nested schema...]
+		auto &full_path = ref.qualified_name.Path();
+		vector<Identifier> parts(full_path.begin(), full_path.end() - 1);
+		auto written = QualifiedName::FromPath(parts).ToString();
+		// the leading part is the database when one by that name is attached, otherwise the schemas are in the
+		// database the search path gives for the outermost one
+		auto resolved = Binder::ResolveCatalog(context, QualifiedName::FromPath(parts));
+		auto &resolved_path = resolved.Path();
+		auto catalog_name = resolved_path.front();
+		vector<Identifier> schema_path(resolved_path.begin() + 1, resolved_path.end());
+		auto schema_entry = Catalog::GetSchema(context, catalog_name, schema_path, OnEntryNotFound::RETURN_NULL);
+		if (!schema_entry) {
+			throw CatalogException("SHOW TABLES FROM: No catalog + schema named \"%s\" found.", written);
+		}
+		sql = PragmaShowTables(schema_entry->ParentCatalog().GetName().GetIdentifierName(),
+		                       schema_entry->name.GetIdentifierName(), schema_entry->oid);
 	} else if (ref.show_type == ShowType::SHOW_FROM) {
 		auto catalog_name = ref.GetCatalogName();
 		auto schema_name = ref.GetSchemaName();
@@ -190,14 +207,13 @@ BoundStatement Binder::BindDescribeTable(ShowRef &ref) {
 				// "a.b" can also name a nested schema
 				vector<Identifier> nested_path {catalog_name, schema_name};
 				schema_entry = Catalog::GetSchema(context, Identifier(), nested_path, OnEntryNotFound::RETURN_NULL);
-				if (schema_entry) {
-					schema_oid = schema_entry->oid;
-				}
 			}
 			if (!schema_entry) {
 				throw CatalogException("SHOW TABLES FROM: No catalog + schema named \"%s.%s\" found.",
 				                       catalog_name.GetIdentifierName(), schema_name.GetIdentifierName());
 			}
+			// filter on the schema itself: a nested schema elsewhere can have the same name
+			schema_oid = schema_entry->oid;
 		} else if (catalog_name.empty() && !schema_name.empty()) {
 			// We have a schema name, use default catalog
 			auto &client_data = ClientData::Get(context);
@@ -208,6 +224,7 @@ BoundStatement Binder::BindDescribeTable(ShowRef &ref) {
 				throw CatalogException("SHOW TABLES FROM: No catalog + schema named \"%s.%s\" found.",
 				                       catalog_name.GetIdentifierName(), schema_name.GetIdentifierName());
 			}
+			schema_oid = schema_entry->oid;
 		}
 		sql = PragmaShowTables(catalog_name.GetIdentifierName(), schema_name.GetIdentifierName(), schema_oid);
 	} else if (lname == "\"variables\"") {
