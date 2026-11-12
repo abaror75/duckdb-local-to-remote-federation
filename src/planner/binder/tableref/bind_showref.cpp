@@ -174,7 +174,7 @@ BoundStatement Binder::BindDescribeTable(ShowRef &ref) {
 		      "WHERE dbs.internal = false "
 		      "ORDER BY all;";
 	} else if (lname == "\"tables\"") {
-		sql = PragmaShowTables();
+		sql = PragmaShowTablesInSearchPath(context);
 	} else if (ref.show_type == ShowType::SHOW_FROM && ref.qualified_name.Path().size() > 3) {
 		// "SHOW TABLES FROM a.b.c": the path before the empty table name is [database?, schema, nested schema...]
 		auto &full_path = ref.qualified_name.Path();

@@ -176,7 +176,8 @@ void Binder::SearchSchema(CreateInfo &info) {
 		// no catalog and no schema given: use the search path default for both
 		auto &default_entry = search_path->GetDefault();
 		catalog = default_entry.GetCatalog();
-		schema_path.push_back(default_entry.GetSchema());
+		// the default schema can be nested (USE db.schema.nested_schema): create in it, not in a top-level namesake
+		schema_path = default_entry.GetSchemaPath();
 	} else if (schema_path.empty()) {
 		// a catalog was given but no schema: use the catalog's default schema
 		auto default_schema = search_path->GetDefaultSchema(context, catalog);

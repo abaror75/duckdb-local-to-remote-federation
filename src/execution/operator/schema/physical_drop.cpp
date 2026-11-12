@@ -38,12 +38,18 @@ SourceResultType PhysicalDrop::GetDataInternal(ExecutionContext &context, DataCh
 		auto &client_data = ClientData::Get(context.client);
 		auto &default_entry = client_data.catalog_search_path->GetDefault();
 		auto &current_catalog = default_entry.GetCatalog();
-		auto &current_schema = default_entry.GetSchema();
+		auto current_schema_path = default_entry.GetSchemaPath();
 		D_ASSERT(info->GetQualifiedName().Name() != DEFAULT_SCHEMA);
 
+		// the dropped schema is the current one, or contains it (a nested current schema goes with its parent)
+		auto &dropped_path = info->GetQualifiedName().Path();
+		bool contains_current = dropped_path.size() >= 2 && dropped_path.size() - 1 <= current_schema_path.size();
+		for (idx_t i = 1; contains_current && i < dropped_path.size(); i++) {
+			contains_current = dropped_path[i] == current_schema_path[i - 1];
+		}
 		auto resolved_current_catalog =
 		    IsInvalidCatalog(current_catalog) ? DatabaseManager::GetDefaultDatabase(context.client) : current_catalog;
-		if (catalog.GetName() == resolved_current_catalog && current_schema == info->GetQualifiedName().Name()) {
+		if (catalog.GetName() == resolved_current_catalog && contains_current) {
 			// Reset the schema to default
 			SchemaSetting::SetLocal(context.client, DEFAULT_SCHEMA);
 		}

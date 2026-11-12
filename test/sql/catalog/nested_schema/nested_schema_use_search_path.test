@@ -1,0 +1,170 @@
+# name: test/sql/catalog/nested_schema/nested_schema_use_search_path.test
+# description: USE, SET schema and SET search_path take a nested schema path, with or without the database
+# group: [nested_schema]
+
+statement ok
+ATTACH ':memory:' AS lake;
+
+statement ok
+CREATE SCHEMA lake.s3tablescatalog;
+
+statement ok
+CREATE SCHEMA lake.s3tablescatalog.salesdemo;
+
+statement ok
+CREATE SCHEMA lake.s3tablescatalog.salesdemo.retail;
+
+statement ok
+CREATE TABLE lake.s3tablescatalog.salesdemo.retail.widget AS SELECT 1 AS id;
+
+# a top-level schema with the same name as the nested one
+statement ok
+CREATE SCHEMA lake.retail;
+
+statement ok
+CREATE TABLE lake.retail.widget AS SELECT 99 AS id;
+
+statement ok
+CREATE TABLE lake.retail.only_top AS SELECT 1 AS x;
+
+# USE with the database and three schema levels
+statement ok
+USE lake.s3tablescatalog.salesdemo.retail;
+
+query III
+SELECT current_database(), current_schema(), current_setting('search_path');
+----
+lake	retail	lake.s3tablescatalog.salesdemo.retail
+
+query I
+SELECT id FROM widget;
+----
+1
+
+statement error
+SELECT * FROM only_top;
+----
+does not exist
+
+query I
+SHOW TABLES;
+----
+widget
+
+# unqualified CREATE goes into the nested schema, not the top-level one of the same name
+statement ok
+CREATE TABLE made_here AS SELECT 5 AS v;
+
+statement ok
+CREATE MACRO m(x) AS x + 1;
+
+statement ok
+CREATE SEQUENCE sq;
+
+statement ok
+CREATE VIEW v AS SELECT id FROM widget;
+
+query II
+SELECT s.parent_schema, t.table_name FROM duckdb_tables() t JOIN duckdb_schemas() s ON s.oid = t.schema_oid WHERE t.table_name = 'made_here';
+----
+salesdemo	made_here
+
+query III
+SELECT m(1), nextval('sq'), (SELECT id FROM v);
+----
+2	1	1
+
+query I
+SELECT v FROM lake.s3tablescatalog.salesdemo.retail.made_here;
+----
+5
+
+# USE with the schema path alone, from the database that holds it
+statement ok
+USE lake;
+
+statement ok
+USE s3tablescatalog.salesdemo.retail;
+
+query I
+SELECT id FROM widget;
+----
+1
+
+# SET schema
+statement ok
+USE memory;
+
+statement ok
+SET schema = 'lake.s3tablescatalog.salesdemo.retail';
+
+query I
+SELECT id FROM widget;
+----
+1
+
+# SET search_path with a nested and a top-level schema: the first one that has the name wins
+statement ok
+SET search_path = 'lake.s3tablescatalog.salesdemo.retail,lake.retail';
+
+query II
+SELECT (SELECT id FROM widget), (SELECT x FROM only_top);
+----
+1	1
+
+query I
+SELECT current_schemas(false);
+----
+[s3tablescatalog.salesdemo.retail, retail]
+
+# dropping a schema that holds the current schema resets it
+statement ok
+USE lake.s3tablescatalog.salesdemo.retail;
+
+statement ok
+DROP SCHEMA lake.s3tablescatalog CASCADE;
+
+query II
+SELECT current_database(), current_schema();
+----
+lake	main
+
+# a missing nested path is not found
+statement error
+USE lake.nope.retail;
+----
+No catalog + schema named "lake.nope.retail" found
+
+statement error
+SET search_path = 'lake.retail.nope';
+----
+No catalog + schema named "lake.retail.nope" found
+
+# when the leading part names an attached database it is the database, with no fallback to a schema of that name
+statement ok
+ATTACH ':memory:' AS shadow;
+
+statement ok
+CREATE SCHEMA lake.shadow;
+
+statement ok
+CREATE SCHEMA lake.shadow.inner_schema;
+
+statement ok
+CREATE SCHEMA lake.shadow.inner_schema.deep;
+
+statement ok
+USE lake;
+
+statement error
+USE shadow.inner_schema.deep;
+----
+No catalog + schema named "shadow.inner_schema.deep" found
+
+statement ok
+USE lake.shadow.inner_schema.deep;
+
+query I
+SELECT current_setting('search_path');
+----
+lake.shadow.inner_schema.deep

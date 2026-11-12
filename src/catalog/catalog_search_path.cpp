@@ -68,8 +68,9 @@ string CatalogSearchEntry::ListToString(const vector<CatalogSearchEntry> &input)
 }
 
 CatalogSearchEntry CatalogSearchEntry::ParseInternal(const string &input, idx_t &idx) {
-	string catalog;
-	string schema;
+	// [schema], [catalog.schema], or [catalog.schema.nested_schema...]: CatalogSearchPath::Set decides whether a
+	// leading part that names no database is a schema of the default database instead
+	vector<string> parts;
 	string entry;
 	bool finished = false;
 normal:
@@ -95,16 +96,7 @@ separator:
 	if (entry.empty()) {
 		throw ParserException("Unexpected dot - empty CatalogSearchEntry");
 	}
-	if (schema.empty()) {
-		// if we parse one entry it is the schema
-		schema = std::move(entry);
-	} else if (catalog.empty()) {
-		// if we parse two entries it is [catalog.schema]
-		catalog = std::move(schema);
-		schema = std::move(entry);
-	} else {
-		throw ParserException("Too many dots - expected [schema] or [catalog.schema] for CatalogSearchEntry");
-	}
+	parts.push_back(std::move(entry));
 	entry = "";
 	idx++;
 	if (finished) {
@@ -112,10 +104,17 @@ separator:
 	}
 	goto normal;
 final:
-	if (schema.empty()) {
+	if (parts.empty()) {
 		throw ParserException("Unexpected end of entry - empty CatalogSearchEntry");
 	}
-	return CatalogSearchEntry(Identifier(std::move(catalog)), Identifier(std::move(schema)));
+	if (parts.size() == 1) {
+		return CatalogSearchEntry(Identifier(), Identifier(std::move(parts[0])));
+	}
+	vector<Identifier> schema_path;
+	for (idx_t i = 1; i < parts.size(); i++) {
+		schema_path.emplace_back(std::move(parts[i]));
+	}
+	return FromSchemaPath(Identifier(std::move(parts[0])), std::move(schema_path));
 }
 
 CatalogSearchEntry CatalogSearchEntry::Parse(const string &input) {
@@ -176,6 +175,30 @@ void CatalogSearchPath::Set(vector<CatalogSearchEntry> new_paths, CatalogSetPath
 			}
 			continue;
 		}
+		if (path.IsNested()) {
+			// [catalog.]schema.nested_schema...: the leading part is the database whenever one by that name is attached,
+			// with no fallback to reading it as a schema - the same rule as for every qualified entry name
+			auto &db_manager = DatabaseManager::Get(context);
+			if (db_manager.GetDatabase(context, path.GetCatalog())) {
+				auto schema_path = path.GetSchemaPath();
+				if (Catalog::GetSchema(context, path.GetCatalog(), schema_path, OnEntryNotFound::RETURN_NULL)) {
+					continue;
+				}
+				throw CatalogException("%s: No catalog + schema named \"%s\" found.", GetSetName(set_type),
+				                       path.ToString());
+			}
+			// otherwise every part is a schema, starting from the default database
+			vector<Identifier> schema_path {path.GetCatalog()};
+			for (auto &schema : path.GetSchemaPath()) {
+				schema_path.push_back(schema);
+			}
+			auto default_database = DatabaseManager::GetDefaultDatabase(context);
+			if (Catalog::GetSchema(context, default_database, schema_path, OnEntryNotFound::RETURN_NULL)) {
+				path = CatalogSearchEntry::FromSchemaPath(default_database, std::move(schema_path));
+				continue;
+			}
+			throw CatalogException("%s: No catalog + schema named \"%s\" found.", GetSetName(set_type), path.ToString());
+		}
 		auto schema_entry =
 		    Catalog::GetSchema(context, path.GetCatalog(), path.GetSchema(), OnEntryNotFound::RETURN_NULL);
 		if (schema_entry) {
@@ -201,12 +224,12 @@ void CatalogSearchPath::Set(vector<CatalogSearchEntry> new_paths, CatalogSetPath
 			}
 		}
 		if (!path.GetCatalog().empty()) {
-			// "a.b" can also name a nested schema - give a clearer error in that case
+			// "a.b" can also name a nested schema of the default database
 			vector<Identifier> nested_path {path.GetCatalog(), path.GetSchema()};
-			if (Catalog::GetSchema(context, Identifier(), nested_path, OnEntryNotFound::RETURN_NULL)) {
-				throw NotImplementedException("%s: \"%s\" is a nested schema - nested schemas cannot be used in the "
-				                              "search path",
-				                              GetSetName(set_type), path.ToString());
+			auto default_database = DatabaseManager::GetDefaultDatabase(context);
+			if (Catalog::GetSchema(context, default_database, nested_path, OnEntryNotFound::RETURN_NULL)) {
+				path = CatalogSearchEntry::FromSchemaPath(default_database, std::move(nested_path));
+				continue;
 			}
 		}
 		throw CatalogException("%s: No catalog + schema named \"%s\" found.", GetSetName(set_type), path.ToString());

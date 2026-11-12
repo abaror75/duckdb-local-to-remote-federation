@@ -67,7 +67,17 @@ unique_ptr<FunctionData> CurrentSchemasBind(BindScalarFunctionInput &input) {
 		auto &catalog_search_path = ClientData::Get(context).catalog_search_path;
 		auto &search_path = implicit_schemas ? catalog_search_path->Get() : catalog_search_path->GetSetPaths();
 		std::transform(search_path.begin(), search_path.end(), std::back_inserter(schema_list),
-		               [](const CatalogSearchEntry &s) -> Value { return Value(s.GetSchema()); });
+		               [](const CatalogSearchEntry &s) -> Value {
+			               if (!s.IsNested()) {
+				               return Value(s.GetSchema());
+			               }
+			               // a nested schema is shown with the schemas that contain it
+			               string path;
+			               for (auto &schema : s.GetSchemaPath()) {
+				               path += (path.empty() ? "" : ".") + schema.GetIdentifierName();
+			               }
+			               return Value(path);
+		               });
 		result_val = Value::LIST(LogicalType::VARCHAR, schema_list);
 	}
 	return make_uniq<CurrentSchemasBindData>(std::move(result_val));

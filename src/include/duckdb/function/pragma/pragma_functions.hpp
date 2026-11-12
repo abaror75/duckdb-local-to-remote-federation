@@ -23,7 +23,9 @@ struct PragmaFunctions {
 };
 
 string PragmaShowTables(const string &catalog = "", const string &schema = "",
-                        optional_idx schema_oid = optional_idx());
+                        optional_idx schema_oid = optional_idx(), const vector<idx_t> &nested_search_path_oids = {});
+//! SHOW TABLES with no schema: the tables of every schema in the search path, nested ones included
+string PragmaShowTablesInSearchPath(ClientContext &context);
 string PragmaShowTablesExpanded();
 string PragmaShowDatabases();
 string PragmaShowVariables();

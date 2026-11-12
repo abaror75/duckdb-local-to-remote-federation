@@ -1,4 +1,6 @@
 #include "duckdb/common/assert.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -21,7 +23,8 @@ static string PragmaTableInfo(ClientContext &context, const FunctionParameters &
 	return StringUtil::Format("SELECT * FROM pragma_table_info(%s);", SQLString(parameters.values[0].ToString()));
 }
 
-string PragmaShowTables(const string &database, const string &schema, optional_idx schema_oid) {
+string PragmaShowTables(const string &database, const string &schema, optional_idx schema_oid,
+                        const vector<idx_t> &nested_search_path_oids) {
 	string where_clause = "";
 	vector<string> where_conditions;
 	if (schema_oid.IsValid()) {
@@ -36,7 +39,12 @@ string PragmaShowTables(const string &database, const string &schema, optional_i
 		}
 	}
 	if (where_conditions.empty()) {
-		where_conditions.push_back("in_search_path(database_name, schema_name)");
+		// in_search_path matches by name, so the nested schemas of the search path are matched by oid
+		string condition = "in_search_path(database_name, schema_name)";
+		for (auto &oid : nested_search_path_oids) {
+			condition += StringUtil::Format(" OR schema_oid = %llu", oid);
+		}
+		where_conditions.push_back("(" + condition + ")");
 	}
 	where_clause = "WHERE " + StringUtil::Join(where_conditions, " AND ");
 
@@ -66,8 +74,23 @@ string PragmaShowTables(const string &database, const string &schema, optional_i
 	// clang-format on
 }
 
+string PragmaShowTablesInSearchPath(ClientContext &context) {
+	vector<idx_t> nested_oids;
+	for (auto &entry : ClientData::Get(context).catalog_search_path->Get()) {
+		if (!entry.IsNested()) {
+			continue;
+		}
+		auto schema =
+		    Catalog::GetSchema(context, entry.GetCatalog(), entry.GetSchemaPath(), OnEntryNotFound::RETURN_NULL);
+		if (schema) {
+			nested_oids.push_back(schema->oid);
+		}
+	}
+	return PragmaShowTables("", "", optional_idx(), nested_oids);
+}
+
 static string PragmaShowTables(ClientContext &context, const FunctionParameters &parameters) {
-	return PragmaShowTables();
+	return PragmaShowTablesInSearchPath(context);
 }
 
 string PragmaShowTablesExpanded() {
